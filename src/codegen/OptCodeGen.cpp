@@ -467,8 +467,7 @@ private:
         }
         // |c| >= 3, not a power of two:  r = n - (n/c)*c  via magic division
         emitMagicQuotient(X_A6, ra, c);
-        out_ << "  li " << S << ", " << c << "\n";
-        out_ << "  mul " << regName(X_A7) << ", " << regName(X_A6) << ", " << S << "\n";
+        emitMulConst(X_A7, X_A6, c);   // a7 = q * c (strength-reduced)
         out_ << "  sub " << D << ", " << R << ", " << regName(X_A7) << "\n";
     }
 
