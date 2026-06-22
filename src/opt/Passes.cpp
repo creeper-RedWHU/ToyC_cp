@@ -1,11 +1,86 @@
 #include "opt/Passes.h"
 #include <map>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace toyc {
 namespace {
 
 bool isCmp(Op op) { return op >= Op::Lt && op <= Op::Ne; }
+
+// ---- function inlining (single-block, non-recursive callees) ----------------
+// Inline calls to small straight-line functions (one basic block, ending in a
+// return) by splicing a renamed copy of the callee's body into the caller's
+// block. This needs no CFG surgery and cannot form cycles: ToyC forbids forward
+// calls, so the call graph (minus self-loops) is a DAG, and self-recursive
+// calls are explicitly skipped.
+int instCount(const IRFunc& f) {
+    int n = 0; for (auto& bb : f.blocks) n += (int)bb.insts.size(); return n;
+}
+
+bool inlinable(const IRFunc& g) {
+    return g.blocks.size() == 1 && g.blocks[0].term == Term::Ret &&
+           g.name != "main" && instCount(g) <= 24;
+}
+
+Val cloneVal(const Val& v, int vBase) {
+    return v.isReg() ? Val::R(v.reg + vBase) : v;
+}
+
+Inst cloneInst(const Inst& in, int vBase) {
+    Inst c = in;
+    if (c.dst >= 0) c.dst += vBase;
+    c.a = cloneVal(in.a, vBase);
+    c.b = cloneVal(in.b, vBase);
+    c.args.clear();
+    for (auto& a : in.args) c.args.push_back(cloneVal(a, vBase));
+    return c;
+}
+
+// Returns true if anything was inlined in this sweep.
+bool inlineSweep(IRModule& mod, std::unordered_map<std::string, IRFunc*>& byName) {
+    bool any = false;
+    for (auto& F : mod.funcs) {
+        for (auto& B : F.blocks) {
+            std::vector<Inst> out;
+            out.reserve(B.insts.size());
+            for (auto& in : B.insts) {
+                IRFunc* G = nullptr;
+                if (in.op == Op::Call) {
+                    auto it = byName.find(in.callee->name);
+                    if (it != byName.end()) G = it->second;
+                }
+                if (G && G != &F && inlinable(*G) && (int)in.args.size() == G->numParams) {
+                    int vBase = F.numVregs;
+                    F.numVregs += G->numVregs;
+                    const BasicBlock& gb = G->blocks[0];
+                    for (int j = 0; j < G->numParams; j++) {
+                        Inst mv; mv.op = Op::Mv; mv.dst = G->paramRegs[j] + vBase; mv.a = in.args[j];
+                        out.push_back(std::move(mv));
+                    }
+                    for (auto& gi : gb.insts) out.push_back(cloneInst(gi, vBase));
+                    if (in.dst >= 0 && gb.retHasVal) {
+                        Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = cloneVal(gb.retVal, vBase);
+                        out.push_back(std::move(mv));
+                    }
+                    any = true;
+                } else {
+                    out.push_back(in);
+                }
+            }
+            B.insts = std::move(out);
+        }
+    }
+    return any;
+}
+
+void inlineFunctions(IRModule& mod) {
+    std::unordered_map<std::string, IRFunc*> byName;
+    for (auto& f : mod.funcs) byName[f.name] = &f;
+    for (int pass = 0; pass < 5; pass++)
+        if (!inlineSweep(mod, byName)) break;
+}
 
 // ---- dead code elimination -------------------------------------------------
 // Remove value-producing instructions whose result is never used. Calls and
@@ -125,6 +200,7 @@ void hoistLoopConstants(IRFunc& fn) {
 } // namespace
 
 void optimizeIR(IRModule& mod, bool opt) {
+    if (opt) inlineFunctions(mod);
     for (auto& fn : mod.funcs) {
         deadCodeElim(fn);
         if (opt) hoistLoopConstants(fn);
