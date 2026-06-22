@@ -111,7 +111,7 @@ private:
         emitTerm(f, bb);
     }
 
-    void emitEpilogue(const IRFunc& f) {
+    void emitEpilogue() {
         loadOff("ra", raOff_);
         if (fits12(frameSize_)) out_ << "  addi sp, sp, " << frameSize_ << "\n";
         else out_ << "  li t6, " << frameSize_ << "\n  add sp, sp, t6\n";
@@ -131,10 +131,10 @@ private:
             }
             case Term::Ret:
                 if (bb.retHasVal) loadVal(bb.retVal, "a0");
-                emitEpilogue(f);
+                emitEpilogue();
                 break;
             case Term::None:
-                emitEpilogue(f);   // should not happen; be safe
+                emitEpilogue();   // should not happen; be safe
                 break;
         }
     }
