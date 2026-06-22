@@ -1,0 +1,8 @@
+int side() { return 42; }
+int main() {
+    side();        // unused call result
+    1 + 2;         // dead expression statement
+    int x = 5;
+    x + 1;         // dead
+    return x;
+}

@@ -1,0 +1,8 @@
+int acc = 0;
+void add(int x) { acc = acc + x; }
+void maybe(int x) { if (x % 2 == 0) add(x); return; }
+int main() {
+    int i = 0;
+    while (i < 20) { maybe(i); i = i + 1; }
+    return acc;   // sum of evens 0..18 = 90
+}

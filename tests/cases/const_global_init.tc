@@ -1,0 +1,4 @@
+const int A = 5;
+const int B = A * 3 + 1;   // 16
+int g = B - A;             // 11
+int main() { return g + A + B; }   // 11+5+16 = 32
