@@ -1,0 +1,9 @@
+int main() {
+    int x = 1;
+    {
+        int x = 2;
+        { int x = 3; if (x != 3) return 100; }
+        if (x != 2) return 101;
+    }
+    return x;
+}

@@ -1,4 +1,5 @@
 #include "codegen/CodeGen.h"
+#include <cstdlib>
 #include <sstream>
 
 namespace toyc {
@@ -199,10 +200,14 @@ private:
 
 } // namespace
 
-std::string generateAsm(const IRModule& mod, bool opt) {
-    (void)opt;   // optimizing path added later
+std::string generateAsmNaive(const IRModule& mod) {
     NaiveCodeGen g(mod);
     return g.run();
+}
+
+std::string generateAsm(const IRModule& mod, bool opt) {
+    if (std::getenv("TOYC_NAIVE")) return generateAsmNaive(mod);
+    return generateAsmOpt(mod, opt);
 }
 
 } // namespace toyc

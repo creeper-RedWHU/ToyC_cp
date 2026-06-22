@@ -51,17 +51,17 @@ void Parser::parseTopLevel(Module& m) {
         return;
     }
     if (check(Tok::Kw_int)) {
-        advance();
-        // 'int' ID  -> decide function vs global variable by the next token.
-        if (!check(Tok::Ident)) error("expected identifier after 'int'");
-        if (peek(1).kind == Tok::LParen) {
+        // 'int' ID '('  -> function ;  'int' ID '='  -> global variable.
+        if (peek(1).kind != Tok::Ident) error("expected identifier after 'int'");
+        if (peek(2).kind == Tok::LParen) {
+            advance();   // consume 'int'; parseFuncDef starts at the name
             TopLevel t; t.kind = TopLevel::Kind::Func;
             t.func = parseFuncDef(false);
             t.func->line = line;
             m.items.push_back(std::move(t));
         } else {
             TopLevel t; t.kind = TopLevel::Kind::Global;
-            t.global = parseGlobalVar(false);
+            t.global = parseGlobalVar(false);   // consumes 'int' itself
             t.global->line = line;
             m.items.push_back(std::move(t));
         }
@@ -198,15 +198,32 @@ ExprPtr Parser::parseLOr() {
 }
 
 ExprPtr Parser::parseLAnd() {
-    ExprPtr lhs = parseRel();
+    ExprPtr lhs = parseEq();
     while (check(Tok::AndAnd)) {
         int line = cur().line; advance();
-        ExprPtr rhs = parseRel();
+        ExprPtr rhs = parseEq();
         auto e = std::make_unique<LogicalExpr>(false, std::move(lhs), std::move(rhs));
         e->line = line;
         lhs = std::move(e);
     }
     return lhs;
+}
+
+// Equality binds looser than the other relational operators, matching C
+// (the grammar lists them at one level, but program semantics must match C).
+ExprPtr Parser::parseEq() {
+    ExprPtr lhs = parseRel();
+    for (;;) {
+        BinOp op;
+        if (check(Tok::Eq)) op = BinOp::Eq;
+        else if (check(Tok::Ne)) op = BinOp::Ne;
+        else return lhs;
+        int line = cur().line; advance();
+        ExprPtr rhs = parseRel();
+        auto e = std::make_unique<BinaryExpr>(op, std::move(lhs), std::move(rhs));
+        e->line = line;
+        lhs = std::move(e);
+    }
 }
 
 ExprPtr Parser::parseRel() {
@@ -218,8 +235,6 @@ ExprPtr Parser::parseRel() {
             case Tok::Gt: op = BinOp::Gt; break;
             case Tok::Le: op = BinOp::Le; break;
             case Tok::Ge: op = BinOp::Ge; break;
-            case Tok::Eq: op = BinOp::Eq; break;
-            case Tok::Ne: op = BinOp::Ne; break;
             default: return lhs;
         }
         int line = cur().line; advance();

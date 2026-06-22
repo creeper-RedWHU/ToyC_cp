@@ -1,0 +1,4 @@
+int g = 0;
+void a(int x) { g = g + x; return; }
+void b(int x) { g = g + x; }
+int main() { a(10); b(20); a(5); return g; }   // 35

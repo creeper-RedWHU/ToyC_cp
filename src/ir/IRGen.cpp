@@ -159,15 +159,19 @@ void IRGen::genStmt(Stmt* s) {
             break;
         }
         case Stmt::Kind::While: {
+            // Rotated layout: the body block is created before the condition
+            // block so that, in emission order [body, cond, after], the body
+            // falls through to the condition and the condition branches back to
+            // the body -- one branch per iteration instead of two.
             auto* w = static_cast<WhileStmt*>(s);
-            int cBB = newBlock();
             int bBB = newBlock();
+            int cBB = newBlock();
             int aBB = newBlock();
-            termJmp(cBB);
-            startBlock(cBB); genCond(w->cond.get(), bBB, aBB);
-            loops_.push_back({cBB, aBB});
+            termJmp(cBB);                         // initial guard
+            loops_.push_back({cBB, aBB});         // continue -> cond, break -> after
             startBlock(bBB); genStmt(w->body.get()); termJmp(cBB);
             loops_.pop_back();
+            startBlock(cBB); genCond(w->cond.get(), bBB, aBB);
             startBlock(aBB);
             break;
         }

@@ -1,0 +1,6 @@
+int f(int x) {
+    if (x > 0) return 1;
+    return 2;
+    x = 999;   // dead
+}
+int main() { return f(5) + f(-5); }   // 1 + 2 = 3

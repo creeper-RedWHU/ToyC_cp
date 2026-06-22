@@ -1,0 +1,9 @@
+int g = 0;
+int inc() { g = g + 1; return g; }
+int main() {
+    int a = 1 || inc();   // inc not called
+    int b = 0 && inc();   // not called
+    int c = 1 && inc();   // called -> g = 1
+    int d = 0 || inc();   // called -> g = 2
+    return g * 10 + a + b + c + d;   // 20 + 1 + 0 + 1 + 1 = 23
+}
