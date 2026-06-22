@@ -12,6 +12,12 @@ bool fits12(long x) { return x >= -2048 && x <= 2047; }
 int align16(int x) { return (x + 15) & ~15; }
 bool isCmp(Op op) { return op >= Op::Lt && op <= Op::Ne; }
 
+// exact log2 of a power of two, else -1
+int log2exact(uint32_t v) {
+    if (v == 0 || (v & (v - 1))) return -1;
+    int k = 0; while (v > 1) { v >>= 1; k++; } return k;
+}
+
 Op invertCmp(Op op) {
     switch (op) {
         case Op::Lt: return Op::Ge; case Op::Ge: return Op::Lt;
@@ -309,6 +315,21 @@ private:
             int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
             out_ << (op == Op::Eq ? "  seqz " : "  snez ") << regName(rd) << ", " << regName(ra) << "\n"; writeBack(dst, rd); return;
         }
+        // strength reduction by a constant
+        if (op == Op::Mul && (in.a.isImm() || in.b.isImm())) {
+            Val var = in.a.isImm() ? in.b : in.a;
+            int32_t c = in.a.isImm() ? in.a.imm : in.b.imm;
+            int ra = toReg(var, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
+            emitMulConst(rd, ra, c); writeBack(dst, rd); return;
+        }
+        if (op == Op::Div && in.b.isImm() && opt_) {
+            int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
+            emitDivConst(rd, ra, in.b.imm); writeBack(dst, rd); return;
+        }
+        if (op == Op::Mod && in.b.isImm() && opt_) {
+            int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
+            emitModConst(rd, ra, in.b.imm); writeBack(dst, rd); return;
+        }
 
         int ra = toReg(in.a, SCRATCH0);
         int rb = toReg(in.b, SCRATCH1);
@@ -329,6 +350,68 @@ private:
             default: break;
         }
         writeBack(dst, rd);
+    }
+
+    // ---- strength reduction by a constant ----------------------------------
+    void emitMulConst(int rd, int ra, int32_t c) {
+        std::string D = regName(rd), R = regName(ra), S = regName(SCRATCH1);
+        if (c == 0) { out_ << "  li " << D << ", 0\n"; return; }
+        if (c == 1) { if (rd != ra) out_ << "  mv " << D << ", " << R << "\n"; return; }
+        if (c == -1) { out_ << "  neg " << D << ", " << R << "\n"; return; }
+        uint32_t ac = c < 0 ? (uint32_t)(-(int64_t)c) : (uint32_t)c;
+        int k = log2exact(ac);
+        if (k >= 1) {
+            out_ << "  slli " << D << ", " << R << ", " << k << "\n";
+            if (c < 0) out_ << "  neg " << D << ", " << D << "\n";
+            return;
+        }
+        int kp = log2exact(ac - 1);            // ac = 2^kp + 1
+        if (kp >= 1) {
+            out_ << "  slli " << S << ", " << R << ", " << kp << "\n  add " << D << ", " << S << ", " << R << "\n";
+            if (c < 0) out_ << "  neg " << D << ", " << D << "\n";
+            return;
+        }
+        int km = log2exact(ac + 1);            // ac = 2^km - 1
+        if (km >= 1) {
+            out_ << "  slli " << S << ", " << R << ", " << km << "\n  sub " << D << ", " << S << ", " << R << "\n";
+            if (c < 0) out_ << "  neg " << D << ", " << D << "\n";
+            return;
+        }
+        out_ << "  li " << S << ", " << c << "\n  mul " << D << ", " << R << ", " << S << "\n";
+    }
+
+    void emitDivConst(int rd, int ra, int32_t c) {
+        std::string D = regName(rd), R = regName(ra), S = regName(SCRATCH1);
+        if (c == 1) { if (rd != ra) out_ << "  mv " << D << ", " << R << "\n"; return; }
+        if (c == -1) { out_ << "  neg " << D << ", " << R << "\n"; return; }
+        uint32_t ac = c < 0 ? (uint32_t)(-(int64_t)c) : (uint32_t)c;
+        int k = log2exact(ac);
+        if (k >= 1) {
+            out_ << "  srai " << S << ", " << R << ", 31\n";
+            out_ << "  srli " << S << ", " << S << ", " << (32 - k) << "\n";
+            out_ << "  add "  << S << ", " << R << ", " << S << "\n";
+            out_ << "  srai " << D << ", " << S << ", " << k << "\n";
+            if (c < 0) out_ << "  neg " << D << ", " << D << "\n";
+            return;
+        }
+        out_ << "  li " << S << ", " << c << "\n  div " << D << ", " << R << ", " << S << "\n";
+    }
+
+    void emitModConst(int rd, int ra, int32_t c) {
+        std::string D = regName(rd), R = regName(ra), S = regName(SCRATCH1);
+        uint32_t ac = c < 0 ? (uint32_t)(-(int64_t)c) : (uint32_t)c;
+        if (ac == 1) { out_ << "  li " << D << ", 0\n"; return; }
+        int k = log2exact(ac);
+        if (k >= 1) {
+            out_ << "  srai " << S << ", " << R << ", 31\n";
+            out_ << "  srli " << S << ", " << S << ", " << (32 - k) << "\n";
+            out_ << "  add "  << S << ", " << R << ", " << S << "\n";
+            out_ << "  srai " << S << ", " << S << ", " << k << "\n";
+            out_ << "  slli " << S << ", " << S << ", " << k << "\n";
+            out_ << "  sub "  << D << ", " << R << ", " << S << "\n";
+            return;
+        }
+        out_ << "  li " << S << ", " << c << "\n  rem " << D << ", " << R << ", " << S << "\n";
     }
 
     void emitCall(const Inst& in) {

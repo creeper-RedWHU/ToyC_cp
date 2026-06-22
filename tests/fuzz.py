@@ -36,16 +36,21 @@ def gen_expr(depth, use_mul):
         if random.random() < 0.5:
             return str(random.randint(-9, 9))
         return random.choice(VARS)
+    # constants chosen to exercise strength reduction: powers of two, 2^k+-1,
+    # negatives, and large values
+    SR = [-256, -100, -16, -8, -7, -5, -4, -3, -2, 2, 3, 4, 5, 7, 8, 9, 10, 16, 100, 256, 1000]
     choice = random.random()
     a = lambda: gen_expr(depth - 1, use_mul)
-    if choice < 0.30:
+    if choice < 0.26:
         return "(" + a() + random.choice([" + ", " - "]) + a() + ")"
+    if choice < 0.38 and use_mul:
+        return "(" + a() + " * " + str(random.choice(SR)) + ")"
     if choice < 0.45 and use_mul:
         return "(" + a() + " * " + a() + ")"
     if choice < 0.55:
-        return "(" + a() + " / " + str(random.randint(1, 9)) + ")"
+        return "(" + a() + " / " + str(random.choice([d for d in SR if d != 0])) + ")"
     if choice < 0.62:
-        return "(" + a() + " % " + str(random.randint(1, 9)) + ")"
+        return "(" + a() + " % " + str(random.choice([d for d in SR if d != 0])) + ")"
     if choice < 0.78:
         return "(" + a() + random.choice([" < ", " > ", " <= ", " >= ", " == ", " != "]) + a() + ")"
     if choice < 0.90:
