@@ -60,7 +60,9 @@ for tc in "$CASES_DIR"/$GLOB; do
   if ! "$RVGCC" $RVFLAGS "$RT/start.S" "$s" -o "$elf" 2>"$TMP/$name.lerr"; then
     echo "FAIL  $name (assemble/link error -> $TMP/$name.lerr)"; fail=$((fail+1)); failed_list="$failed_list $name"; continue
   fi
-  "$SPIKE" --isa=$SPIKE_ISA "$elf" >/dev/null 2>&1; got=$?
+  TIMEOUT="${TIMEOUT:-timeout 10}"
+  $TIMEOUT "$SPIKE" --isa=$SPIKE_ISA "$elf" >/dev/null 2>&1; got=$?
+  if [ "$got" = "124" ]; then echo "FAIL  $name (TIMEOUT / likely infinite loop)"; fail=$((fail+1)); failed_list="$failed_list $name"; continue; fi
   got=$(( (got % 256 + 256) % 256 ))
 
   if [ "$got" = "$exp" ]; then

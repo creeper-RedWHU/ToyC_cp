@@ -2,6 +2,7 @@
 #include "parser/Parser.h"
 #include "sema/Sema.h"
 #include "ir/IRGen.h"
+#include "opt/Passes.h"
 #include "codegen/CodeGen.h"
 
 #include <iostream>
@@ -35,6 +36,8 @@ int main(int argc, char** argv) {
 
         IRGen irgen;
         IRModule ir = irgen.generate(mod, globalCount);
+
+        optimizeIR(ir, opt);
 
         std::string asmText = generateAsm(ir, opt);
         std::cout << asmText;
