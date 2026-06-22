@@ -39,7 +39,8 @@ private:
     ExprPtr parseExpr();
     ExprPtr parseLOr();
     ExprPtr parseLAnd();
-    ExprPtr parseRel();
+    ExprPtr parseEq();      // == != (C precedence: below relational)
+    ExprPtr parseRel();     // < > <= >=
     ExprPtr parseAdd();
     ExprPtr parseMul();
     ExprPtr parseUnary();

@@ -1,0 +1,9 @@
+const int N = 10;
+int counter = N * 2;          // 20, constant global init
+int total = 0;
+void add(int x) { total = total + x; }
+int main() {
+    int i = 0;
+    while (i < N) { add(counter + i); i = i + 1; }
+    return total % 256;       // sum(20+i, i=0..9) = 200 + 45 = 245
+}
