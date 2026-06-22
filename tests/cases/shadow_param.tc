@@ -1,0 +1,6 @@
+int f(int x) {
+    int r = x;
+    { int x = 100; r = r + x; { int x = 1000; r = r + x; } }
+    return r + x;   // x is param again
+}
+int main() { return f(7); }   // 7 + 100 + 1000 + 7 = 1114, %256
