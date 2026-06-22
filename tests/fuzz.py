@@ -101,8 +101,62 @@ def gen_program_cf():
             "  int k0 = 0; int k1 = 0; int k2 = 0;\n"
             f"  {body}\n  return s + a - b;\n}}\n")
 
+# --- multi-function generator with (non-recursive) calls --------------------
+def gen_program_calls():
+    nf = random.randint(2, 4)
+    funcs = []
+    sigs = []   # (name, nparams)
+    for i in range(nf):
+        name = f"f{i}"
+        npar = random.randint(1, 3)
+        params = [f"p{j}" for j in range(npar)]
+        pvars = list(params)
+
+        def leaf():
+            r = random.random()
+            if r < 0.5 and pvars:
+                return random.choice(pvars)
+            return str(random.randint(-9, 9))
+
+        def call_expr():
+            cands = [s for s in sigs]
+            if not cands:
+                return leaf()
+            cn, cp = random.choice(cands)
+            args = ", ".join(arith(1) for _ in range(cp))
+            return f"{cn}({args})"
+
+        def arith(d):
+            if d <= 0:
+                return leaf()
+            r = random.random()
+            if r < 0.20 and sigs:
+                return call_expr()
+            if r < 0.45:
+                return "(" + arith(d-1) + random.choice([" + ", " - ", " * "]) + arith(d-1) + ")"
+            if r < 0.70:
+                return "(" + arith(d-1) + random.choice([" < ", " > ", " == ", " != ", " <= ", " >= "]) + arith(d-1) + ")"
+            if r < 0.85:
+                return "(" + arith(d-1) + random.choice([" && ", " || "]) + arith(d-1) + ")"
+            return leaf()
+
+        body = f"  return {arith(2)};\n"
+        plist = ", ".join(f"int {p}" for p in params)
+        funcs.append(f"int {name}({plist}) {{\n{body}}}\n")
+        sigs.append((name, npar))
+
+    # main
+    mcall = sigs[-1]
+    margs = ", ".join(str(random.randint(-9, 9)) for _ in range(mcall[1]))
+    main = (f"int main() {{\n  int x = {mcall[0]}({margs});\n"
+            f"  return x + {random.randint(-9,9)};\n}}\n")
+    return "".join(funcs) + main
+
 def gen_program():
-    return gen_program_cf() if random.random() < 0.5 else gen_program_expr()
+    r = random.random()
+    if r < 0.34: return gen_program_cf()
+    if r < 0.67: return gen_program_calls()
+    return gen_program_expr()
 
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, **kw)
@@ -131,7 +185,13 @@ def main():
         ln = run([RVGCC] + RVFLAGS + [os.path.join(RT, "start.S"), s, "-o", elf])
         if ln.returncode != 0:
             print(f"[{k}] LINK ERROR\n{prog}\n{ln.stderr.decode()}"); fails += 1; continue
-        got = run([SPIKE, "--isa=rv32im", elf]).returncode & 0xFF
+        try:
+            got = run([SPIKE, "--isa=rv32im", elf], timeout=15).returncode & 0xFF
+        except subprocess.TimeoutExpired:
+            print(f"[{k}] TIMEOUT (likely miscompiled loop)\n{prog}"); fails += 1
+            if fails >= 5:
+                print("stopping after 5 failures"); break
+            continue
         if got != exp:
             print(f"[{k}] MISMATCH exp={exp} got={got}\n{prog}"); fails += 1
             if fails >= 5:
