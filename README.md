@@ -57,3 +57,12 @@ tests/run_tests.sh -opt     # with optimizations
 
 Requirements for local testing: a RISC-V GCC (`riscv64-unknown-elf-gcc`,
 used only as assembler/linker via `-march=rv32im`) and `spike`.
+
+## Documentation
+
+| 文档 | 内容 |
+|------|------|
+| [doc/report/实践报告.md](doc/report/实践报告.md) | 实践报告（架构、各阶段、优化、测试、性能） |
+| [doc/git.md](doc/git.md) | 分支管理与四人协作开发规范 |
+| [doc/skill/](doc/skill/) | 可复用工程经验（编译器/RV32 代码生成/寄存器分配/差分测试/性能度量） |
+| [doc/任务要求.md](doc/任务要求.md) | 原始任务要求 |
