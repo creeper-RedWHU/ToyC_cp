@@ -48,6 +48,7 @@ private:
     Allocation A_;
     int outArgArea_ = 0, spillBase_ = 0, calleeBase_ = 0, raOff_ = 0, frameSize_ = 0;
     std::vector<int> useCount_;
+    int dstOverride_ = -1;   // force the next instruction's result into this reg
 
     int spillOff(int v) const { return spillBase_ + A_.spillSlot[v] * 4; }
 
@@ -84,8 +85,11 @@ private:
         else loadSpill(r, v.reg);
     }
 
-    int dstReg(int v, int scratch) { int p = A_.reg[v]; return p >= 0 ? p : scratch; }
-    void writeBack(int v, int r) { if (A_.reg[v] < 0) storeSpill(r, v); }
+    int dstReg(int v, int scratch) {
+        if (dstOverride_ >= 0) return dstOverride_;
+        int p = A_.reg[v]; return p >= 0 ? p : scratch;
+    }
+    void writeBack(int v, int r) { if (dstOverride_ < 0 && A_.reg[v] < 0) storeSpill(r, v); }
 
     // ------------------------------------------------------------------------
     void emitData() {
@@ -185,18 +189,24 @@ private:
     void emitBlock(const BasicBlock& bb, int next) {
         out_ << label(bb.id) << ":\n";
 
-        // detect a fusible comparison feeding the terminating Br
+        // detect a fusible comparison feeding the terminating Br, or a value
+        // computed by the last instruction and only used by a Ret
         const Inst* fused = nullptr;
+        const Inst* retFuse = nullptr;
         if (bb.term == Term::Br && !bb.insts.empty()) {
             const Inst& last = bb.insts.back();
             if (isCmp(last.op) && last.dst == bb.cond.reg && useCount_[last.dst] == 1)
                 fused = &last;
+        } else if (bb.term == Term::Ret && bb.retHasVal && bb.retVal.isReg() && !bb.insts.empty()) {
+            const Inst& last = bb.insts.back();
+            if (last.dst == bb.retVal.reg && useCount_[last.dst] == 1)
+                retFuse = &last;
         }
         for (size_t i = 0; i < bb.insts.size(); i++) {
-            if (fused && i == bb.insts.size() - 1) break;
+            if ((fused || retFuse) && i == bb.insts.size() - 1) break;
             emitInst(bb.insts[i]);
         }
-        emitTerm(bb, next, fused);
+        emitTerm(bb, next, fused, retFuse);
     }
 
     void emitEpilogue() {
@@ -226,7 +236,7 @@ private:
         }
     }
 
-    void emitTerm(const BasicBlock& bb, int next, const Inst* fused) {
+    void emitTerm(const BasicBlock& bb, int next, const Inst* fused, const Inst* retFuse = nullptr) {
         switch (bb.term) {
             case Term::Jmp:
                 if (bb.succ0 != next) out_ << "  j " << label(bb.succ0) << "\n";
@@ -246,7 +256,8 @@ private:
                 break;
             }
             case Term::Ret:
-                if (bb.retHasVal) materialize(bb.retVal, X_A0);
+                if (retFuse) { dstOverride_ = X_A0; emitInst(*retFuse); dstOverride_ = -1; }
+                else if (bb.retHasVal) materialize(bb.retVal, X_A0);
                 emitEpilogue();
                 break;
             case Term::None:
@@ -258,8 +269,9 @@ private:
     void emitInst(const Inst& in) {
         switch (in.op) {
             case Op::Mv: {
-                if (A_.reg[in.dst] >= 0) materialize(in.a, A_.reg[in.dst]);
-                else { materialize(in.a, SCRATCH0); storeSpill(SCRATCH0, in.dst); }
+                int rd = dstReg(in.dst, SCRATCH0);
+                materialize(in.a, rd);
+                writeBack(in.dst, rd);
                 break;
             }
             case Op::LoadGlobal: {
@@ -424,9 +436,13 @@ private:
         for (int i = 0; i < n && i < 8; i++) materialize(in.args[i], X_A0 + i);
         out_ << "  call " << in.callee->name << "\n";
         if (in.dst >= 0) {
-            int p = A_.reg[in.dst];
-            if (p >= 0) { if (p != X_A0) out_ << "  mv " << regName(p) << ", a0\n"; }
-            else storeSpill(X_A0, in.dst);
+            if (dstOverride_ >= 0) {
+                if (dstOverride_ != X_A0) out_ << "  mv " << regName(dstOverride_) << ", a0\n";
+            } else {
+                int p = A_.reg[in.dst];
+                if (p >= 0) { if (p != X_A0) out_ << "  mv " << regName(p) << ", a0\n"; }
+                else storeSpill(X_A0, in.dst);
+            }
         }
     }
 };
