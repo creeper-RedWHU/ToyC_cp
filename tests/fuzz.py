@@ -157,10 +157,30 @@ def gen_program_calls():
             f"  return x + {random.randint(-9,9)};\n}}\n")
     return "".join(funcs) + main
 
+# --- recursive generator (guaranteed-terminating) ---------------------------
+def gen_program_recursive():
+    base = random.randint(-5, 5)
+    op = random.choice(["+", "-"])
+    term = random.choice(["n", "(n * 2)", "(n % 4)", "(n / 2)", str(random.randint(1, 5))])
+    if random.random() < 0.5:
+        # f(n): decreases n to the base case
+        body = (f"int f(int n) {{ if (n <= 0) return {base}; "
+                f"return {term} {op} f(n - 1); }}")
+        start = random.randint(0, 18)
+        main = f"int main() {{ return f({start}); }}"
+    else:
+        # accumulator form f(n, acc)
+        body = (f"int f(int n, int acc) {{ if (n <= 0) return acc; "
+                f"return f(n - 1, acc {op} {term}); }}")
+        start = random.randint(0, 18)
+        main = f"int main() {{ return f({start}, {random.randint(-5,5)}); }}"
+    return body + "\n" + main + "\n"
+
 def gen_program():
     r = random.random()
-    if r < 0.34: return gen_program_cf()
-    if r < 0.67: return gen_program_calls()
+    if r < 0.28: return gen_program_cf()
+    if r < 0.52: return gen_program_calls()
+    if r < 0.72: return gen_program_recursive()
     return gen_program_expr()
 
 def run(cmd, **kw):
