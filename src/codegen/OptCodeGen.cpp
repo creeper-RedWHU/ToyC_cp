@@ -18,6 +18,29 @@ int log2exact(uint32_t v) {
     int k = 0; while (v > 1) { v >>= 1; k++; } return k;
 }
 
+// Magic number / shift for signed division by a constant d (|d| >= 3, not a
+// power of two), per Hacker's Delight 10-1: q = n/d via the high half of a
+// signed multiply by M, a correction, an arithmetic shift, and a sign add.
+void signedMagic(int32_t d, int32_t& M, int& s) {
+    const uint32_t two31 = 0x80000000u;
+    uint32_t ad = (d < 0) ? (uint32_t)(-(int64_t)d) : (uint32_t)d;
+    uint32_t t = two31 + ((uint32_t)d >> 31);
+    uint32_t anc = t - 1 - t % ad;
+    int p = 31;
+    uint32_t q1 = two31 / anc, r1 = two31 - q1 * anc;
+    uint32_t q2 = two31 / ad,  r2 = two31 - q2 * ad;
+    uint32_t delta;
+    do {
+        p++;
+        q1 *= 2; r1 *= 2; if (r1 >= anc) { q1++; r1 -= anc; }
+        q2 *= 2; r2 *= 2; if (r2 >= ad)  { q2++; r2 -= ad; }
+        delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+    M = (int32_t)(q2 + 1);
+    if (d < 0) M = -M;
+    s = p - 32;
+}
+
 Op invertCmp(Op op) {
     switch (op) {
         case Op::Lt: return Op::Ge; case Op::Ge: return Op::Lt;
@@ -398,6 +421,20 @@ private:
         else { out_ << "  srai " << S << ", " << R << ", 31\n  srli " << S << ", " << S << ", " << (32 - k) << "\n"; }
     }
 
+    // q = ra / c into register `qreg`, using the signed magic sequence.
+    // Uses t6 and a7 as scratch; ra is preserved.
+    void emitMagicQuotient(int qreg, int ra, int32_t c) {
+        int32_t M; int s; signedMagic(c, M, s);
+        std::string Q = regName(qreg), R = regName(ra), T = regName(SCRATCH1), W = regName(X_A7);
+        out_ << "  li " << T << ", " << M << "\n";
+        out_ << "  mulh " << W << ", " << R << ", " << T << "\n";
+        if (c > 0 && M < 0) out_ << "  add " << W << ", " << W << ", " << R << "\n";
+        else if (c < 0 && M > 0) out_ << "  sub " << W << ", " << W << ", " << R << "\n";
+        if (s > 0) out_ << "  srai " << W << ", " << W << ", " << s << "\n";
+        out_ << "  srli " << T << ", " << W << ", 31\n";
+        out_ << "  add " << Q << ", " << W << ", " << T << "\n";
+    }
+
     void emitDivConst(int rd, int ra, int32_t c) {
         std::string D = regName(rd), R = regName(ra), S = regName(SCRATCH1);
         if (c == 1) { if (rd != ra) out_ << "  mv " << D << ", " << R << "\n"; return; }
@@ -411,6 +448,7 @@ private:
             if (c < 0) out_ << "  neg " << D << ", " << D << "\n";
             return;
         }
+        if (c != 0) { emitMagicQuotient(rd, ra, c); return; }   // |c| >= 3, not pow2
         out_ << "  li " << S << ", " << c << "\n  div " << D << ", " << R << ", " << S << "\n";
     }
 
@@ -427,7 +465,11 @@ private:
             out_ << "  sub "  << D << ", " << R << ", " << S << "\n";
             return;
         }
-        out_ << "  li " << S << ", " << c << "\n  rem " << D << ", " << R << ", " << S << "\n";
+        // |c| >= 3, not a power of two:  r = n - (n/c)*c  via magic division
+        emitMagicQuotient(X_A6, ra, c);
+        out_ << "  li " << S << ", " << c << "\n";
+        out_ << "  mul " << regName(X_A7) << ", " << regName(X_A6) << ", " << S << "\n";
+        out_ << "  sub " << D << ", " << R << ", " << regName(X_A7) << "\n";
     }
 
     void emitCall(const Inst& in) {
