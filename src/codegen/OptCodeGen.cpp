@@ -380,6 +380,12 @@ private:
         out_ << "  li " << S << ", " << c << "\n  mul " << D << ", " << R << ", " << S << "\n";
     }
 
+    // S = (R < 0) ? (2^k - 1) : 0   (the rounding bias for signed /,% by 2^k)
+    void emitPow2Bias(const std::string& S, const std::string& R, int k) {
+        if (k == 1) out_ << "  srli " << S << ", " << R << ", 31\n";
+        else { out_ << "  srai " << S << ", " << R << ", 31\n  srli " << S << ", " << S << ", " << (32 - k) << "\n"; }
+    }
+
     void emitDivConst(int rd, int ra, int32_t c) {
         std::string D = regName(rd), R = regName(ra), S = regName(SCRATCH1);
         if (c == 1) { if (rd != ra) out_ << "  mv " << D << ", " << R << "\n"; return; }
@@ -387,8 +393,7 @@ private:
         uint32_t ac = c < 0 ? (uint32_t)(-(int64_t)c) : (uint32_t)c;
         int k = log2exact(ac);
         if (k >= 1) {
-            out_ << "  srai " << S << ", " << R << ", 31\n";
-            out_ << "  srli " << S << ", " << S << ", " << (32 - k) << "\n";
+            emitPow2Bias(S, R, k);
             out_ << "  add "  << S << ", " << R << ", " << S << "\n";
             out_ << "  srai " << D << ", " << S << ", " << k << "\n";
             if (c < 0) out_ << "  neg " << D << ", " << D << "\n";
@@ -403,8 +408,7 @@ private:
         if (ac == 1) { out_ << "  li " << D << ", 0\n"; return; }
         int k = log2exact(ac);
         if (k >= 1) {
-            out_ << "  srai " << S << ", " << R << ", 31\n";
-            out_ << "  srli " << S << ", " << S << ", " << (32 - k) << "\n";
+            emitPow2Bias(S, R, k);
             out_ << "  add "  << S << ", " << R << ", " << S << "\n";
             out_ << "  srai " << S << ", " << S << ", " << k << "\n";
             out_ << "  slli " << S << ", " << S << ", " << k << "\n";
