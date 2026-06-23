@@ -1,0 +1,24 @@
+// 优化正确性：LICM（循环不变量外提）
+// 循环中不依赖循环变量的计算应被提升到循环前
+// -opt 和 无 -opt 结果必须相同
+
+int g_base = 7;
+
+int compute_invariant(int a, int b) {
+    return a * b + 1;   // 纯函数，结果不依赖全局状态
+}
+
+int main() {
+    int a = 3;
+    int b = 4;
+    int sum = 0;
+    int i = 0;
+    while (i < 100) {
+        // (a * b + 1) 是循环不变量，LICM 应将其提升
+        int inv = a * b + 1;   // 13，每次迭代相同
+        sum = sum + inv + i;
+        i = i + 1;
+    }
+    // sum = sum of (13 + i) for i=0..99 = 13*100 + (0+1+...+99) = 1300 + 4950 = 6250
+    return sum % 256;   // 6250 % 256 = 106
+}

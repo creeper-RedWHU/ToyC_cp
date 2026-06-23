@@ -1,0 +1,25 @@
+// 测试 16 个参数的函数调用（超过 8 个走栈传参）
+// RISC-V 调用约定：a0-a7 传前 8 个，其余通过栈传递
+int sum16(int a, int b, int c, int d,
+          int e, int f, int g, int h,
+          int p, int q, int r, int s,
+          int t, int u, int v, int w) {
+    return a + b + c + d + e + f + g + h
+         + p + q + r + s + t + u + v + w;
+}
+
+// 再测试栈参数与寄存器参数混合使用的场景
+int pick_stack(int a, int b, int c, int d,
+               int e, int f, int g, int h,
+               int ninth, int tenth) {
+    return ninth + tenth;   // 仅用栈上参数
+}
+
+int main() {
+    int total = sum16(1, 2, 3, 4, 5, 6, 7, 8,
+                      9, 10, 11, 12, 13, 14, 15, 16);
+    // 1+2+...+16 = 136
+    int stack_sum = pick_stack(0, 0, 0, 0, 0, 0, 0, 0, 42, 58);
+    // 42 + 58 = 100
+    return (total + stack_sum) % 256;   // 236
+}

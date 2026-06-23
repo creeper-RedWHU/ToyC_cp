@@ -1,0 +1,33 @@
+// 测试 void 函数的多条 return 路径
+// void 函数可以有 return; 语句，也可以没有
+int g = 0;
+
+void classify(int x) {
+    if (x < 0) {
+        g = g + 1;
+        return;         // 提前返回
+    }
+    if (x == 0) {
+        g = g + 10;
+        return;         // 提前返回
+    }
+    if (x > 100) {
+        g = g + 100;
+        return;         // 提前返回
+    }
+    g = g + x;          // 正常路径（无显式 return，函数末尾隐式返回）
+}
+
+void no_return_stmt(int x) {
+    // void 函数可以完全没有 return 语句
+    g = g + x * 2;
+}
+
+int main() {
+    classify(-5);    // g = 1
+    classify(0);     // g = 11
+    classify(50);    // g = 61
+    classify(200);   // g = 161
+    no_return_stmt(3); // g = 167
+    return g % 256;  // 167
+}

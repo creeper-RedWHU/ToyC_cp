@@ -1,0 +1,25 @@
+// 性能基准：热循环内频繁调用小函数（测试函数内联收益）
+// -opt 开启内联后，小函数调用开销消失，预期明显提升
+
+int add(int a, int b) { return a + b; }
+int mul2(int x) { return x * 2; }
+int sub1(int x) { return x - 1; }
+int clamp100(int x) {
+    if (x > 100) return 100;
+    if (x < 0) return 0;
+    return x;
+}
+
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 3000000) {
+        int a = add(i % 50, i % 30);
+        int b = mul2(a);
+        int c = sub1(b);
+        int d = clamp100(c);
+        s = add(s, d);
+        i = i + 1;
+    }
+    return s % 256;
+}
