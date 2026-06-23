@@ -14,9 +14,9 @@ int f(int x) {
     return r + x;          // r + 参数x = 2*参数x + 1 + 参数x = 3*参数x + 1
 }
 
-int g(int x) {
-    int x = x * 2;         // 局部 x 屏蔽参数 x（用参数初始化）
-    return x + 1;          // 局部 x + 1
+int g(int p) {
+    int x = p * 2;         // 局部 x 屏蔽（若有）同名变量，用参数 p 初始化
+    return x + 1;          // 局部 x + 1 = p*2 + 1
 }
 
 int main() {
