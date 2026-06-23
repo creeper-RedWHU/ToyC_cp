@@ -1,0 +1,24 @@
+// 专项测试 break/continue 跳出目标的正确性
+// break 跳出其直接所在的最内层 while；不影响外层
+int outer_count = 0;
+int inner_count = 0;
+
+int main() {
+    int i = 0;
+    while (i < 10) {
+        outer_count = outer_count + 1;
+        int j = 0;
+        while (j < 10) {
+            inner_count = inner_count + 1;
+            if (j == 2) break;    // 只退出内层
+            j = j + 1;
+        }
+        if (i == 5) {
+            i = i + 1;
+            continue;             // 外层 continue，跳过后续语句
+        }
+        i = i + 1;
+    }
+    // outer_count == 10, inner_count == 10*3 = 30
+    return outer_count * 10 + inner_count % 10;  // 100 + 0 = 100
+}

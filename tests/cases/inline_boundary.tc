@@ -1,0 +1,28 @@
+// 优化正确性：函数内联边界测试
+// 内联应只对单块小函数生效，结果必须与非内联时相同
+// 该用例在 -opt 和无 -opt 模式下必须返回相同值
+
+int double_val(int x) { return x * 2; }
+int add_one(int x) { return x + 1; }
+int square(int x) { return x * x; }
+int negate(int x) { return 0 - x; }
+
+// 稍大的函数（含多条语句，但仍单块）
+int clamp(int x, int lo, int hi) {
+    int r = x;
+    if (r < lo) r = lo;
+    if (r > hi) r = hi;
+    return r;
+}
+
+int main() {
+    int a = double_val(5);      // 10
+    int b = add_one(a);         // 11
+    int c = square(3);          // 9
+    int d = negate(c);          // -9
+    int e = double_val(add_one(3));  // double(4) = 8
+    int f = clamp(150, 0, 100); // 100
+    int g = clamp(-5, 0, 100);  // 0
+    return (a + b + c + d + e + f + g) % 256;
+    // 10 + 11 + 9 + (-9) + 8 + 100 + 0 = 129
+}

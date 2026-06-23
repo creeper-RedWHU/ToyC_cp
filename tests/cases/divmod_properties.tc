@@ -1,0 +1,30 @@
+// 验证 C 语言截断除法性质：(a/b)*b + a%b == a
+// 针对多种符号组合进行验证，任意失败返回非 0 错误码
+int check(int a, int b) {
+    int q = a / b;
+    int r = a % b;
+    if (q * b + r != a) return 1;
+    return 0;
+}
+
+int main() {
+    int fail = 0;
+    // 正 / 正
+    fail = fail + check(17, 5);
+    fail = fail + check(100, 7);
+    fail = fail + check(0, 3);
+    fail = fail + check(1, 1);
+    // 负 / 正（截断向零）
+    fail = fail + check(-17, 5);
+    fail = fail + check(-100, 7);
+    // 正 / 负
+    fail = fail + check(17, -5);
+    fail = fail + check(100, -7);
+    // 负 / 负
+    fail = fail + check(-17, -5);
+    fail = fail + check(-100, -7);
+    // 边界
+    fail = fail + check(2147483647, 3);
+    fail = fail + check(-2147483647, 3);
+    return fail;   // 全部通过时返回 0
+}
