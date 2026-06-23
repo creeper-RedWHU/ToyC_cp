@@ -1,0 +1,34 @@
+// 测试超大栈帧（100 个局部变量，超过 12 位有符号立即数范围）
+// 100 个 int = 400 字节，sp 偏移超过 12 位（±2048），需要用临时寄存器构造地址
+int main() {
+    int v00 = 1;   int v01 = 2;   int v02 = 3;   int v03 = 4;
+    int v04 = 5;   int v05 = 6;   int v06 = 7;   int v07 = 8;
+    int v08 = 9;   int v09 = 10;  int v10 = 11;  int v11 = 12;
+    int v12 = 13;  int v13 = 14;  int v14 = 15;  int v15 = 16;
+    int v16 = 17;  int v17 = 18;  int v18 = 19;  int v19 = 20;
+    int v20 = 21;  int v21 = 22;  int v22 = 23;  int v23 = 24;
+    int v24 = 25;  int v25 = 26;  int v26 = 27;  int v27 = 28;
+    int v28 = 29;  int v29 = 30;  int v30 = 31;  int v31 = 32;
+    int v32 = 33;  int v33 = 34;  int v34 = 35;  int v35 = 36;
+    int v36 = 37;  int v37 = 38;  int v38 = 39;  int v39 = 40;
+    int v40 = 41;  int v41 = 42;  int v42 = 43;  int v43 = 44;
+    int v44 = 45;  int v45 = 46;  int v46 = 47;  int v47 = 48;
+    int v48 = 49;  int v49 = 50;  int v50 = 51;  int v51 = 52;
+    int v52 = 53;  int v53 = 54;  int v54 = 55;  int v55 = 56;
+    int v56 = 57;  int v57 = 58;  int v58 = 59;  int v59 = 60;
+    int v60 = 61;  int v61 = 62;  int v62 = 63;  int v63 = 64;
+    int v64 = 65;  int v65 = 66;  int v66 = 67;  int v67 = 68;
+    int v68 = 69;  int v69 = 70;  int v70 = 71;  int v71 = 72;
+    int v72 = 73;  int v73 = 74;  int v74 = 75;  int v75 = 76;
+    int v76 = 77;  int v77 = 78;  int v78 = 79;  int v79 = 80;
+    int v80 = 81;  int v81 = 82;  int v82 = 83;  int v83 = 84;
+    int v84 = 85;  int v85 = 86;  int v86 = 87;  int v87 = 88;
+    int v88 = 89;  int v89 = 90;  int v90 = 91;  int v91 = 92;
+    int v92 = 93;  int v93 = 94;  int v94 = 95;  int v95 = 96;
+    int v96 = 97;  int v97 = 98;  int v98 = 99;  int v99 = 100;
+
+    // 验证首尾和部分中间变量未被破坏（全部用 %256 防大数）
+    int s1 = v00 + v49 + v99;  // 1 + 50 + 100 = 151
+    int s2 = v25 + v50 + v75;  // 26 + 51 + 76 = 153
+    return (s1 + s2) % 256;    // 304 % 256 = 48
+}

@@ -1,0 +1,49 @@
+// 测试深层嵌套块作用域（20 层）
+// 验证 scoping 实现不会因嵌套深度导致错误
+int main() {
+    int x = 1;
+    {   int x = 2;
+        {   int x = 3;
+            {   int x = 4;
+                {   int x = 5;
+                    {   int x = 6;
+                        {   int x = 7;
+                            {   int x = 8;
+                                {   int x = 9;
+                                    {   int x = 10;
+                                        {   int x = 11;
+                                            {   int x = 12;
+                                                {   int x = 13;
+                                                    {   int x = 14;
+                                                        {   int x = 15;
+                                                            if (x != 15) return 200;
+                                                        }
+                                                        if (x != 14) return 201;
+                                                    }
+                                                    if (x != 13) return 202;
+                                                }
+                                                if (x != 12) return 203;
+                                            }
+                                            if (x != 11) return 204;
+                                        }
+                                        if (x != 10) return 205;
+                                    }
+                                    if (x != 9) return 206;
+                                }
+                                if (x != 8) return 207;
+                            }
+                            if (x != 7) return 208;
+                        }
+                        if (x != 6) return 209;
+                    }
+                    if (x != 5) return 210;
+                }
+                if (x != 4) return 211;
+            }
+            if (x != 3) return 212;
+        }
+        if (x != 2) return 213;
+    }
+    if (x != 1) return 214;
+    return 0;   // 全部正确
+}

@@ -1,0 +1,31 @@
+// 性能基准：模拟矩阵乘法（用线性下标访问代替数组）
+// 三层嵌套循环，测试 LICM、loop rotation 以及乘法优化
+
+// 由于 ToyC 无数组，用函数模拟元素访问（固定尺寸 N=16）
+// A[i][j] = (i * 3 + j * 7 + 1) % 50   (确定性初始化)
+// B[i][j] = (i * 5 + j * 2 + 3) % 50
+// C[i][j] = sum_k A[i][k] * B[k][j]
+
+int elem_a(int i, int j) { return (i * 3 + j * 7 + 1) % 50; }
+int elem_b(int i, int j) { return (i * 5 + j * 2 + 3) % 50; }
+
+int main() {
+    int N = 16;
+    int total = 0;
+    int i = 0;
+    while (i < N) {
+        int j = 0;
+        while (j < N) {
+            int c_ij = 0;
+            int k = 0;
+            while (k < N) {
+                c_ij = c_ij + elem_a(i, k) * elem_b(k, j);
+                k = k + 1;
+            }
+            total = total + c_ij;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return total % 256;
+}

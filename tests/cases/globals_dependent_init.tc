@@ -1,0 +1,18 @@
+// 测试全局变量相互依赖初始化
+// 全局变量按声明顺序初始化
+// 预期：各变量值组合的结果
+const int BASE = 7;
+int a = BASE * 2;      // 14
+int b = a + BASE;      // 21  (a 必须先于 b 初始化)
+int c = b * 2 - a;    // 28
+int d = c + a + b;    // 28 + 14 + 21 = 63
+
+void modify() {
+    a = a + 1;         // 15
+    b = b + 1;         // 22
+}
+
+int main() {
+    modify();
+    return (a + b + c + d) % 256;  // 15 + 22 + 28 + 63 = 128
+}

@@ -1,0 +1,16 @@
+// 测试复杂常量表达式折叠
+// 所有初始化必须编译期可确定
+// 预期：计算链最终结果
+const int A = 4;
+const int B = A * A;          // 16
+const int C = B - A + 1;      // 13
+const int D = C * 2 - B / 4;  // 26 - 4 = 22
+const int E = D % (A + 1);    // 22 % 5 = 2
+const int F = (A + B) * (C - E);  // 20 * 11 = 220
+
+int main() {
+    const int G = F / 4;       // 55
+    const int H = G + E * 3;   // 55 + 6 = 61
+    return (A + B + C + D + E + G + H) % 256;
+    // 4 + 16 + 13 + 22 + 2 + 55 + 61 = 173
+}

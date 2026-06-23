@@ -1,0 +1,31 @@
+// 优化正确性：递归函数不应被内联（防止无限展开）
+// 结果与 -opt 和无 -opt 应相同
+
+int fact(int n) {
+    if (n <= 1) return 1;
+    return n * fact(n - 1);
+}
+
+int fib(int n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+// 间接递归（mutual recursion）
+int is_even(int n);
+int is_odd(int n) {
+    if (n == 0) return 0;
+    return is_even(n - 1);
+}
+int is_even(int n) {
+    if (n == 0) return 1;
+    return is_odd(n - 1);
+}
+
+int main() {
+    int a = fact(8) % 256;   // 40320 % 256 = 64
+    int b = fib(12) % 256;   // 144
+    int c = is_odd(7);       // 1
+    int d = is_even(10);     // 1
+    return (a + b + c + d) % 256;  // (64 + 144 + 1 + 1) % 256 = 210
+}

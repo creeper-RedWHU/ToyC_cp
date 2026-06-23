@@ -1,0 +1,23 @@
+// 优化正确性：含全局变量写的表达式不能被 LICM 错误提升
+// 如果 LICM 错误提升了含副作用的表达式，结果会出错
+
+int g = 0;
+
+int inc_and_get() {
+    g = g + 1;
+    return g;
+}
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 5) {
+        // inc_and_get() 有副作用（修改全局 g），不能被 LICM 提升
+        int v = inc_and_get();   // 每次结果不同：1,2,3,4,5
+        sum = sum + v;
+        i = i + 1;
+    }
+    // sum = 1+2+3+4+5 = 15
+    // g = 5
+    return sum * 10 + g;  // 15*10 + 5 = 155
+}

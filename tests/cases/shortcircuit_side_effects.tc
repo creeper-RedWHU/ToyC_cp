@@ -1,0 +1,34 @@
+// 测试短路求值与全局变量副作用的精确计数
+// 验证短路时确实不执行右侧表达式
+
+int call_count = 0;
+
+int counted(int val) {
+    call_count = call_count + 1;
+    return val;
+}
+
+int main() {
+    // && 短路：左侧为假时不求值右侧
+    int r1 = counted(0) && counted(1);   // 左侧返回0，短路，count=1
+    if (call_count != 1) return 1;       // 仅调用了一次
+
+    // && 不短路：左侧为真时求值右侧
+    int r2 = counted(1) && counted(0);   // 两侧都求值，count=3
+    if (call_count != 3) return 2;
+
+    // || 短路：左侧为真时不求值右侧
+    int r3 = counted(1) || counted(0);   // 左侧返回1，短路，count=4
+    if (call_count != 4) return 3;
+
+    // || 不短路：左侧为假时求值右侧
+    int r4 = counted(0) || counted(1);   // 两侧都求值，count=6
+    if (call_count != 6) return 4;
+
+    // 嵌套短路
+    int r5 = (counted(0) && counted(99)) || counted(1);
+    // && 短路跳过 counted(99)，count=7+1=8; || 右侧被求值
+    if (call_count != 8) return 5;
+
+    return r1 + r2 + r3 + r4 + r5;   // 0+0+1+1+1 = 3
+}
