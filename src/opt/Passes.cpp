@@ -8,6 +8,47 @@ namespace toyc {
 namespace {
 
 bool isCmp(Op op) { return op >= Op::Lt && op <= Op::Ne; }
+bool isBinary(Op op) { return op >= Op::Add && op <= Op::Ne && op != Op::Neg && op != Op::Not; }
+bool isCommutative(Op op) { return op == Op::Add || op == Op::Mul; }
+
+// Canonical key for a binary expression (commutative ops are normalised).
+struct BinKey {
+    Op op;
+    int aTag, bTag;
+    int32_t aImm, bImm;
+    int aReg, bReg;
+    bool operator==(const BinKey& o) const {
+        return op == o.op && aTag == o.aTag && bTag == o.bTag &&
+               aImm == o.aImm && bImm == o.bImm && aReg == o.aReg && bReg == o.bReg;
+    }
+};
+
+struct BinKeyHash {
+    size_t operator()(const BinKey& k) const {
+        auto hv = [&](int tag, int32_t imm, int reg) {
+            return tag == 0 ? (size_t)imm : (size_t)reg + 0x10000;
+        };
+        size_t ha = hv(k.aTag, k.aImm, k.aReg);
+        size_t hb = hv(k.bTag, k.bImm, k.bReg);
+        size_t h = (size_t)k.op;
+        if (isCommutative(k.op)) {
+            h ^= (ha < hb) ? (ha * 31 + hb) : (hb * 31 + ha);
+        } else {
+            h ^= ha * 31 + hb;
+        }
+        return h;
+    }
+};
+
+static BinKey makeKey(const Inst& in) {
+    BinKey k;
+    k.op = in.op;
+    k.aTag = in.a.isImm() ? 0 : 1;
+    k.bTag = in.b.isImm() ? 0 : 1;
+    k.aImm = in.a.imm; k.bImm = in.b.imm;
+    k.aReg = in.a.reg; k.bReg = in.b.reg;
+    return k;
+}
 
 // ---- function inlining (single-block, non-recursive callees) ----------------
 // Inline calls to small straight-line functions (one basic block, ending in a
@@ -197,13 +238,202 @@ void hoistLoopConstants(IRFunc& fn) {
     }
 }
 
+// ---- copy propagation ------------------------------------------------------
+// Replace uses of Mv destinations with their source registers, following
+// chains. DCE subsequently removes the now-dead Mv instructions.
+bool copyProp(IRFunc& fn) {
+    bool any = false;
+    std::unordered_map<int, int> copyMap;
+    for (auto& bb : fn.blocks)
+        for (auto& in : bb.insts)
+            if (in.op == Op::Mv && in.a.isReg())
+                copyMap[in.dst] = in.a.reg;
+    if (copyMap.empty()) return false;
+
+    auto resolve = [&](int v) {
+        int cur = v;
+        for (int i = 0; i < 64; i++) {
+            auto it = copyMap.find(cur);
+            if (it == copyMap.end()) break;
+            cur = it->second;
+        }
+        return cur;
+    };
+
+    auto apply = [&](Val& v) {
+        if (v.isReg()) {
+            int r = resolve(v.reg);
+            if (r != v.reg) { v.reg = r; any = true; }
+        }
+    };
+
+    for (auto& bb : fn.blocks) {
+        for (auto& in : bb.insts) {
+            if (in.op == Op::Mv) continue;
+            apply(in.a); apply(in.b);
+            for (auto& a : in.args) apply(a);
+        }
+        if (bb.term == Term::Br) apply(bb.cond);
+        if (bb.term == Term::Ret && bb.retHasVal) apply(bb.retVal);
+    }
+    return any;
+}
+
+// ---- common subexpression elimination (CSE) --------------------------------
+// Within each basic block, detect identical binary expressions and replace
+// later occurrences with the earlier result.
+bool cseBlock(BasicBlock& bb) {
+    bool any = false;
+    std::unordered_map<BinKey, int, BinKeyHash> avail;
+    std::vector<Inst> out;
+    out.reserve(bb.insts.size());
+
+    auto killDef = [&](int d) {
+        std::vector<BinKey> toRemove;
+        for (auto& [key, reg] : avail) {
+            if ((key.aTag == 1 && key.aReg == d) || (key.bTag == 1 && key.bReg == d))
+                toRemove.push_back(key);
+        }
+        for (auto& k : toRemove) avail.erase(k);
+    };
+
+    for (auto& in : bb.insts) {
+        if (isBinary(in.op) && in.a.isReg() && in.b.isReg()) {
+            BinKey key = makeKey(in);
+            auto it = avail.find(key);
+            if (it != avail.end()) {
+                Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = Val::R(it->second);
+                out.push_back(std::move(mv));
+                killDef(in.dst);
+                any = true;
+                continue;
+            }
+        }
+        if (in.dst >= 0) killDef(in.dst);
+        if (isBinary(in.op) && in.a.isReg() && in.b.isReg())
+            avail[makeKey(in)] = in.dst;
+        out.push_back(in);
+    }
+    bb.insts = std::move(out);
+    return any;
+}
+
+void cse(IRFunc& fn) {
+    for (auto& bb : fn.blocks) cseBlock(bb);
+}
+
+// ---- peephole optimization -------------------------------------------------
+// Local patterns: Mv x,x → remove; Neg(Neg(x)) → x; Not(Not(x)) → x.
+bool peephole(IRFunc& fn) {
+    bool any = false;
+    for (auto& bb : fn.blocks) {
+        std::vector<Inst> out;
+        out.reserve(bb.insts.size());
+        for (auto& in : bb.insts) {
+            if (in.op == Op::Mv && in.a.isReg() && in.dst == in.a.reg)
+                { any = true; continue; }
+
+            if ((in.op == Op::Neg || in.op == Op::Not) && in.a.isReg()) {
+                bool folded = false;
+                for (int i = (int)out.size() - 1; i >= 0; i--) {
+                    if (out[i].dst == in.a.reg) {
+                        if (out[i].op == in.op && out[i].a.isReg()) {
+                            Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = out[i].a;
+                            out.push_back(std::move(mv));
+                            any = true;
+                            folded = true;
+                        }
+                        break;
+                    }
+                    if (out[i].dst == in.a.reg) break;
+                }
+                if (folded) continue;
+            }
+            out.push_back(in);
+        }
+        bb.insts = std::move(out);
+    }
+    return any;
+}
+
+// ---- loop-invariant code motion (LICM) -------------------------------------
+// Hoist instructions whose operands are all defined outside the loop.
+void licm(IRFunc& fn) {
+    computeCFG(fn);
+    int n = (int)fn.blocks.size();
+    if (n == 0) return;
+    auto dom = computeDom(fn);
+
+    for (int u = 0; u < n; u++) {
+        int s[2], ns; succsOf(fn.blocks[u], s, ns);
+        for (int i = 0; i < ns; i++) {
+            int v = s[i];
+            if (v < 0 || !dom[u][v]) continue;
+
+            std::vector<char> inLoop(n, 0);
+            inLoop[v] = 1;
+            std::vector<int> wl;
+            if (u != v) { inLoop[u] = 1; wl.push_back(u); }
+            while (!wl.empty()) {
+                int x = wl.back(); wl.pop_back();
+                for (int p : fn.blocks[x].preds)
+                    if (!inLoop[p]) { inLoop[p] = 1; wl.push_back(p); }
+            }
+
+            int pre = -1; int outside = 0;
+            for (int p : fn.blocks[v].preds)
+                if (!inLoop[p]) { outside++; pre = p; }
+            if (outside != 1) continue;
+            if (fn.blocks[pre].term != Term::Jmp || fn.blocks[pre].succ0 != v) continue;
+
+            std::vector<char> definedOutside(fn.numVregs, 0);
+            for (int b = 0; b < n; b++) {
+                if (inLoop[b]) continue;
+                for (auto& in : fn.blocks[b].insts)
+                    if (in.dst >= 0) definedOutside[in.dst] = 1;
+            }
+
+            auto isInvariant = [&](const Inst& in) -> bool {
+                if (in.dst < 0) return false;
+                if (in.op == Op::Mv || in.op == Op::Neg || in.op == Op::Not)
+                    return !in.a.isReg() || definedOutside[in.a.reg];
+                if (isBinary(in.op))
+                    return (!in.a.isReg() || definedOutside[in.a.reg]) &&
+                           (!in.b.isReg() || definedOutside[in.b.reg]);
+                return false;
+            };
+
+            for (int b = 0; b < n; b++) {
+                if (!inLoop[b]) continue;
+                std::vector<Inst> kept;
+                kept.reserve(fn.blocks[b].insts.size());
+                for (auto& in : fn.blocks[b].insts) {
+                    if (isInvariant(in)) {
+                        fn.blocks[pre].insts.push_back(in);
+                        definedOutside[in.dst] = 1;
+                    } else {
+                        kept.push_back(in);
+                    }
+                }
+                fn.blocks[b].insts = std::move(kept);
+            }
+        }
+    }
+}
+
 } // namespace
 
 void optimizeIR(IRModule& mod, bool opt) {
     if (opt) inlineFunctions(mod);
     for (auto& fn : mod.funcs) {
         deadCodeElim(fn);
-        if (opt) hoistLoopConstants(fn);
+        if (opt) {
+            cse(fn);
+            copyProp(fn);
+            peephole(fn);
+            licm(fn);
+            hoistLoopConstants(fn);
+        }
         deadCodeElim(fn);
     }
 }
