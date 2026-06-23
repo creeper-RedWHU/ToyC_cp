@@ -1,0 +1,28 @@
+// 优化正确性：60 个局部变量的寄存器分配正确性（spill/reload）
+// 远超可用的调用者保存寄存器数量，必然触发大量溢出
+int main() {
+    // 初始化 60 个局部变量
+    int v00=1;  int v01=2;  int v02=3;  int v03=4;  int v04=5;
+    int v05=6;  int v06=7;  int v07=8;  int v08=9;  int v09=10;
+    int v10=11; int v11=12; int v12=13; int v13=14; int v14=15;
+    int v15=16; int v16=17; int v17=18; int v18=19; int v19=20;
+    int v20=21; int v21=22; int v22=23; int v23=24; int v24=25;
+    int v25=26; int v26=27; int v27=28; int v28=29; int v29=30;
+    int v30=31; int v31=32; int v32=33; int v33=34; int v34=35;
+    int v35=36; int v36=37; int v37=38; int v38=39; int v39=40;
+    int v40=41; int v41=42; int v42=43; int v43=44; int v44=45;
+    int v45=46; int v46=47; int v47=48; int v48=49; int v49=50;
+    int v50=51; int v51=52; int v52=53; int v53=54; int v54=55;
+    int v55=56; int v56=57; int v57=58; int v58=59; int v59=60;
+
+    // 使用所有变量（避免被 DCE 清除）
+    int s0 = v00+v01+v02+v03+v04+v05+v06+v07+v08+v09;  // 55
+    int s1 = v10+v11+v12+v13+v14+v15+v16+v17+v18+v19;  // 155
+    int s2 = v20+v21+v22+v23+v24+v25+v26+v27+v28+v29;  // 255
+    int s3 = v30+v31+v32+v33+v34+v35+v36+v37+v38+v39;  // 355
+    int s4 = v40+v41+v42+v43+v44+v45+v46+v47+v48+v49;  // 455
+    int s5 = v50+v51+v52+v53+v54+v55+v56+v57+v58+v59;  // 555
+
+    int total = s0 + s1 + s2 + s3 + s4 + s5;  // 55+155+255+355+455+555 = 1830
+    return total % 256;   // 1830 % 256 = 38
+}

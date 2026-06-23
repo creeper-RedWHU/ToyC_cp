@@ -1,0 +1,25 @@
+// 优化正确性：内联时被内联函数的局部变量不与调用方冲突
+// 调用方和被内联函数都有名为 x, y, r 的局部变量
+int transform(int x) {
+    int y = x + 10;
+    int r = y * 2;
+    return r;
+}
+
+int combine(int x, int y) {
+    int r = x - y;
+    return r + 1;
+}
+
+int main() {
+    int x = 5;
+    int y = 3;
+    int r = x + y;                // r = 8
+    int a = transform(x);         // 内联后 x(被内联)=5, y(被内联)=15, r(被内联)=30
+    int b = combine(y, 1);        // 内联后 x(被内联)=3, y(被内联)=1, r(被内联)=2, return 3
+    // 验证调用方的 x, y, r 未被污染
+    if (x != 5) return 100;
+    if (y != 3) return 101;
+    if (r != 8) return 102;
+    return (a + b) % 256;  // 30 + 3 = 33
+}
