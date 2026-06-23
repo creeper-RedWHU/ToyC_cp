@@ -1,0 +1,24 @@
+// 测试函数有 12 个参数 + 40 个局部变量的混合场景
+// 这会给寄存器分配和栈帧管理同时施压
+int compute(int a, int b, int c, int d,
+            int e, int f, int g, int h,
+            int p, int q, int r, int s) {
+    // 40 个局部变量
+    int l00 = a + b;   int l01 = c + d;   int l02 = e + f;   int l03 = g + h;
+    int l04 = p + q;   int l05 = r + s;   int l06 = l00 + l01; int l07 = l02 + l03;
+    int l08 = l04 + l05; int l09 = l06 + l07; int l10 = l08 + l09;
+    int l11 = l10 + a;  int l12 = l11 + b;  int l13 = l12 + c;  int l14 = l13 + d;
+    int l15 = l14 + e;  int l16 = l15 + f;  int l17 = l16 + g;  int l18 = l17 + h;
+    int l19 = l18 + p;  int l20 = l19 + q;  int l21 = l20 + r;  int l22 = l21 + s;
+    int l23 = l22 - l10; int l24 = l23 + 1; int l25 = l24 * 2;
+    int l26 = l25 / 3;   int l27 = l26 % 7; int l28 = l27 + l00;
+    int l29 = l28 + l01; int l30 = l29 - l02; int l31 = l30 + l03;
+    int l32 = l31 + l04; int l33 = l32 - l05; int l34 = l33 + 1;
+    int l35 = l34 + l06; int l36 = l35 - l07; int l37 = l36 + l08;
+    int l38 = l37 - l09; int l39 = l38 + l10;
+    return l39 % 256;
+}
+
+int main() {
+    return compute(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+}

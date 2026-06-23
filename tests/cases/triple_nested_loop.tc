@@ -1,0 +1,27 @@
+// 测试三层嵌套循环以及内层 break/continue 的正确跳出目标
+// break 只退出最内层循环，continue 只跳过最内层循环的当次迭代
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 5) {
+        int j = 0;
+        while (j < 5) {
+            int k = 0;
+            while (k < 5) {
+                if (k == 3) {
+                    k = k + 1;
+                    continue;    // 跳过 k==3，继续 k 循环
+                }
+                if (i + j + k > 9) {
+                    break;       // 仅退出 k 循环
+                }
+                s = s + 1;
+                k = k + 1;
+            }
+            if (j == 4) break;   // 退出 j 循环
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s % 256;
+}

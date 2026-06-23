@@ -1,0 +1,17 @@
+// 测试较深的递归（200 层），验证栈帧管理正确
+// 每层只做常数工作，保证终止且结果可计算
+int sum_to(int n) {
+    if (n <= 0) return 0;
+    return n + sum_to(n - 1);
+}
+
+int count_down(int n) {
+    if (n == 0) return 1;
+    return count_down(n - 1) + 1;
+}
+
+int main() {
+    int a = sum_to(200) % 256;   // sum 1..200 = 20100, %256 = 20100 - 78*256 = 20100 - 19968 = 132
+    int b = count_down(150) % 256; // 返回 151, %256 = 151
+    return (a + b) % 256;         // (132 + 151) % 256 = 283 % 256 = 27
+}

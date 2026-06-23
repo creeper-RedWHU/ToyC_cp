@@ -1,0 +1,32 @@
+// 性能基准：模拟冒泡排序（用全局数组模拟，实际用变量展开 20 元素）
+// 测试循环优化（rotation、LICM）和分支处理的效率
+
+int swap_count = 0;
+
+// 对固定 20 个变量做完整冒泡排序（无数组，用函数参数传递）
+// 简化版：对 1000 次迭代的排序核心操作做基准
+
+int bubble_step(int a, int b) {
+    if (a > b) {
+        swap_count = swap_count + 1;
+        return b;
+    }
+    return a;
+}
+
+int main() {
+    // 模拟排序：对大量随机对做比较交换
+    // 使用线性同余生成伪随机序列
+    int s = 0;
+    int lcg = 12345;
+    int i = 0;
+    while (i < 500000) {
+        lcg = lcg * 1664525 + 1013904223;   // LCG, 溢出回绕
+        int a = (lcg % 1000 + 1000) % 1000; // 伪随机 0..999
+        lcg = lcg * 1664525 + 1013904223;
+        int b = (lcg % 1000 + 1000) % 1000;
+        s = s + bubble_step(a, b);
+        i = i + 1;
+    }
+    return (s + swap_count) % 256;
+}

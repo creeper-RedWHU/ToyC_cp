@@ -1,0 +1,33 @@
+// 测试多层常量递推初始化
+// 每个 const 的初始化只能使用已声明的常量和字面量
+
+const int C0 = 1;
+const int C1 = C0 + 1;          // 2
+const int C2 = C1 * C1;         // 4
+const int C3 = C2 + C1 + C0;    // 7
+const int C4 = C3 * C2;         // 28
+const int C5 = C4 - C3 + C2;    // 25
+const int C6 = C5 / C1;         // 12 (截断)
+const int C7 = C6 % C3;         // 5
+
+int main() {
+    // 局部常量也可以用全局常量初始化
+    const int L0 = C7 * 2;      // 10
+    const int L1 = L0 + C3;     // 17
+    const int L2 = L1 * C0;     // 17
+
+    // 验证所有常量值
+    int check = 0;
+    if (C0 != 1) check = check + 1;
+    if (C1 != 2) check = check + 2;
+    if (C2 != 4) check = check + 4;
+    if (C3 != 7) check = check + 8;
+    if (C4 != 28) check = check + 16;
+    if (C5 != 25) check = check + 32;
+    if (C6 != 12) check = check + 64;
+    if (C7 != 5) check = check + 128;
+    if (L0 != 10) check = check + 1;
+    if (L1 != 17) check = check + 2;
+    if (L2 != 17) check = check + 4;
+    return check;   // 0 表示全部正确
+}
