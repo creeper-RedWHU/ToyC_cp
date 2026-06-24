@@ -238,45 +238,138 @@ void hoistLoopConstants(IRFunc& fn) {
     }
 }
 
-// ---- copy propagation ------------------------------------------------------
-// Replace uses of Mv destinations with their source registers, following
-// chains. DCE subsequently removes the now-dead Mv instructions.
-bool copyProp(IRFunc& fn) {
-    bool any = false;
-    std::unordered_map<int, int> copyMap;
-    for (auto& bb : fn.blocks)
-        for (auto& in : bb.insts)
-            if (in.op == Op::Mv && in.a.isReg())
-                copyMap[in.dst] = in.a.reg;
-    if (copyMap.empty()) return false;
-
-    auto resolve = [&](int v) {
-        int cur = v;
-        for (int i = 0; i < 64; i++) {
-            auto it = copyMap.find(cur);
-            if (it == copyMap.end()) break;
-            cur = it->second;
-        }
-        return cur;
-    };
-
-    auto apply = [&](Val& v) {
-        if (v.isReg()) {
-            int r = resolve(v.reg);
-            if (r != v.reg) { v.reg = r; any = true; }
-        }
-    };
-
+// ---- algebraic simplification ------------------------------------------------
+// Simplify common algebraic identities at the IR level:
+//   x + 0 = x,  x - 0 = x,  0 - x = -x, x - x = 0
+//   x * 0 = 0,  x * 1 = x,  x * -1 = -x
+//   x / 1 = x,  x / -1 = -x
+//   x % 1 = 0,  x % -1 = 0
+//   Neg(Neg(x)) = x
+//   Ge/Le/Eq(x, x) = 1,  Lt/Gt/Ne(x, x) = 0
+void algebraicSimplify(IRFunc& fn) {
     for (auto& bb : fn.blocks) {
+        std::unordered_map<int, Op> defOp;
+        std::unordered_map<int, Val> defA;
+
         for (auto& in : bb.insts) {
-            if (in.op == Op::Mv) continue;
-            apply(in.a); apply(in.b);
-            for (auto& a : in.args) apply(a);
+            bool sameReg = in.a.isReg() && in.b.isReg() && in.a.reg == in.b.reg;
+
+            switch (in.op) {
+                case Op::Add:
+                    if (in.b.isImm() && in.b.imm == 0) {
+                        in.op = Op::Mv; in.b = Val::I(0);
+                    } else if (in.a.isImm() && in.a.imm == 0) {
+                        in.op = Op::Mv; in.a = in.b; in.b = Val::I(0);
+                    }
+                    break;
+                case Op::Sub:
+                    if (in.b.isImm() && in.b.imm == 0) {
+                        in.op = Op::Mv; in.b = Val::I(0);
+                    } else if (in.a.isImm() && in.a.imm == 0) {
+                        in.op = Op::Neg; in.a = in.b; in.b = Val::I(0);
+                    } else if (sameReg) {
+                        in.op = Op::Mv; in.a = Val::I(0); in.b = Val::I(0);
+                    }
+                    break;
+                case Op::Mul:
+                    if ((in.a.isImm() && in.a.imm == 0) || (in.b.isImm() && in.b.imm == 0)) {
+                        in.op = Op::Mv; in.a = Val::I(0); in.b = Val::I(0);
+                    } else if (in.b.isImm() && in.b.imm == 1) {
+                        in.op = Op::Mv; in.b = Val::I(0);
+                    } else if (in.a.isImm() && in.a.imm == 1) {
+                        in.op = Op::Mv; in.a = in.b; in.b = Val::I(0);
+                    } else if (in.b.isImm() && in.b.imm == -1) {
+                        in.op = Op::Neg; in.b = Val::I(0);
+                    } else if (in.a.isImm() && in.a.imm == -1) {
+                        in.op = Op::Neg; in.a = in.b; in.b = Val::I(0);
+                    }
+                    break;
+                case Op::Div:
+                    if (in.b.isImm() && in.b.imm == 1) {
+                        in.op = Op::Mv; in.b = Val::I(0);
+                    } else if (in.b.isImm() && in.b.imm == -1) {
+                        in.op = Op::Neg; in.b = Val::I(0);
+                    }
+                    break;
+                case Op::Mod:
+                    if (in.b.isImm() && (in.b.imm == 1 || in.b.imm == -1)) {
+                        in.op = Op::Mv; in.a = Val::I(0); in.b = Val::I(0);
+                    }
+                    break;
+                case Op::Lt: case Op::Gt:
+                    if (sameReg) { in.op = Op::Mv; in.a = Val::I(0); in.b = Val::I(0); }
+                    break;
+                case Op::Ge: case Op::Le: case Op::Eq:
+                    if (sameReg) { in.op = Op::Mv; in.a = Val::I(1); in.b = Val::I(0); }
+                    break;
+                case Op::Ne:
+                    if (sameReg) { in.op = Op::Mv; in.a = Val::I(0); in.b = Val::I(0); }
+                    break;
+                case Op::Neg:
+                    if (in.a.isReg()) {
+                        auto it = defOp.find(in.a.reg);
+                        if (it != defOp.end() && it->second == Op::Neg) {
+                            in.op = Op::Mv; in.a = defA[in.a.reg]; in.b = Val::I(0);
+                        }
+                    }
+                    break;
+                default: break;
+            }
+
+            if (in.dst >= 0) {
+                defOp[in.dst] = in.op;
+                defA[in.dst] = in.a;
+            }
         }
-        if (bb.term == Term::Br) apply(bb.cond);
-        if (bb.term == Term::Ret && bb.retHasVal) apply(bb.retVal);
     }
-    return any;
+}
+
+// ---- copy propagation -------------------------------------------------------
+// Forward-substitute copies: if `rd = mv rs` (both virtual regs), subsequent
+// uses of `rd` in the same block are replaced with `rs`. Handles chains
+// (r3=mv r2; r2=mv r1 -> r3->r1) and invalidates when a copy source is
+// redefined.
+void copyPropagation(IRFunc& fn) {
+    for (auto& bb : fn.blocks) {
+        std::unordered_map<int, int> copyOf;
+
+        auto resolve = [&](int r) -> int {
+            auto it = copyOf.find(r);
+            if (it == copyOf.end()) return r;
+            while (it != copyOf.end()) { r = it->second; it = copyOf.find(r); }
+            return r;
+        };
+
+        for (auto& in : bb.insts) {
+            auto rep = [&](Val& v) {
+                if (!v.isReg()) return;
+                int r = resolve(v.reg);
+                if (r != v.reg) v.reg = r;
+            };
+            switch (in.op) {
+                case Op::Mv: case Op::Neg: case Op::Not: case Op::StoreGlobal:
+                    rep(in.a); break;
+                case Op::LoadGlobal: break;
+                case Op::Call: for (auto& a : in.args) rep(a); break;
+                default: rep(in.a); rep(in.b); break;
+            }
+
+            if (in.op == Op::Mv && in.a.isReg()) {
+                copyOf[in.dst] = resolve(in.a.reg);
+            } else if (in.dst >= 0) {
+                copyOf.erase(in.dst);
+                std::vector<int> stale;
+                for (auto& [k, v] : copyOf)
+                    if (v == in.dst) stale.push_back(k);
+                for (int k : stale) copyOf.erase(k);
+            }
+        }
+
+        if (bb.term == Term::Br && bb.cond.isReg())
+            bb.cond.reg = resolve(bb.cond.reg);
+        if (bb.term == Term::Ret && bb.retHasVal && bb.retVal.isReg())
+            bb.retVal.reg = resolve(bb.retVal.reg);
+    }
 }
 
 // ---- common subexpression elimination (CSE) --------------------------------
@@ -290,10 +383,9 @@ bool cseBlock(BasicBlock& bb) {
 
     auto killDef = [&](int d) {
         std::vector<BinKey> toRemove;
-        for (auto& [key, reg] : avail) {
+        for (auto& [key, reg] : avail)
             if ((key.aTag == 1 && key.aReg == d) || (key.bTag == 1 && key.bReg == d))
                 toRemove.push_back(key);
-        }
         for (auto& k : toRemove) avail.erase(k);
     };
 
@@ -323,7 +415,7 @@ void cse(IRFunc& fn) {
 }
 
 // ---- peephole optimization -------------------------------------------------
-// Local patterns: Mv x,x → remove; Neg(Neg(x)) → x; Not(Not(x)) → x.
+// Local patterns: Mv x,x -> remove; Neg(Neg(x)) -> x; Not(Not(x)) -> x.
 bool peephole(IRFunc& fn) {
     bool any = false;
     for (auto& bb : fn.blocks) {
@@ -426,10 +518,11 @@ void licm(IRFunc& fn) {
 void optimizeIR(IRModule& mod, bool opt) {
     if (opt) inlineFunctions(mod);
     for (auto& fn : mod.funcs) {
+        algebraicSimplify(fn);
+        copyPropagation(fn);
         deadCodeElim(fn);
         if (opt) {
             cse(fn);
-            copyProp(fn);
             peephole(fn);
             licm(fn);
             hoistLoopConstants(fn);
