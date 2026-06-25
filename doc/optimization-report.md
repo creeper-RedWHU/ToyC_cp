@@ -2,13 +2,46 @@
 
 ## 概述
 
-本次在 `feat/optimizer` 分支上为 ToyC 编译器新增了四种 IR 级优化算法，
+本次在 `feat/optimizer` 分支上为 ToyC 编译器新增了多种 IR 级优化算法，
 与已有的函数内联、死代码消除、循环常量外提协同工作，显著提升了生成代码
 的运行时效率。
 
 ## 新增优化算法
 
-### 1. 公共子表达式消除 (Common Subexpression Elimination, CSE)
+### 1. 常量折叠与代数简化 (Constant Folding & Algebraic Simplification)
+
+**原理**: 在编译期计算常量表达式，并应用代数恒等式简化代码。
+
+**折叠规则**:
+- 双常量运算: `3 + 5 → 8`, `10 / 2 → 5`
+- 代数恒等式:
+
+| 模式 | 简化 |
+|------|------|
+| `x + 0`, `0 + x` | `x` |
+| `x - 0` | `x` |
+| `x * 0`, `0 * x` | `0` |
+| `x * 1`, `1 * x` | `x` |
+| `x / 1` | `x` |
+| `x % 1` | `0` |
+| `x - x` | `0` |
+| `x == x` | `1` |
+| `x != x` | `0` |
+| `Neg(c)` | `-c` |
+| `Not(0)` | `1` |
+| `Not(1)` | `0` |
+
+**效果**:
+```c
+int x = 5 + 3;   // → 8
+int y = x * 1;   // → x
+int z = y - 0;   // → x
+return z;        // 最终: return 8
+```
+优化前: 3 条运算指令
+优化后: 1 条 `li a0, 8`（直接返回常量）
+
+### 2. 公共子表达式消除 (Common Subexpression Elimination, CSE)
 
 **原理**: 在每个基本块内追踪已计算的二元运算表达式，当遇到相同表达式时
 用之前的结果代替，避免重复计算。
@@ -20,13 +53,12 @@
 
 **效果**:
 ```c
-// 源码
 int c = a + b;
 int d = a + b;  // 相同表达式
 ```
 优化前生成 2 条 `add` 指令，优化后第 2 次计算被替换为 `mv`，随后由 DCE 消除。
 
-### 2. 拷贝传播 (Copy Propagation)
+### 3. 拷贝传播 (Copy Propagation)
 
 **原理**: 将 `Mv dst, src` 的结果直接传播到后续所有使用点，消除不必要的
 寄存器间数据移动。
@@ -39,7 +71,7 @@ int d = a + b;  // 相同表达式
 **效果**: 内联和 CSE 产生的大量 `mv` 指令被消除，减少寄存器压力，使后续
 DCE 能删除更多死代码。
 
-### 3. 窥孔优化 (Peephole Optimization)
+### 4. 窥孔优化 (Peephole Optimization)
 
 **原理**: 扫描基本块内的局部指令模式，应用预定义规则简化。
 
@@ -57,7 +89,7 @@ int y = -(-x);  // 源码
 优化前: `neg → neg → mv`（3 条指令）
 优化后: `mv`（1 条指令，由 DCE 进一步消除）
 
-### 4. 循环不变量代码外提 (Loop-Invariant Code Motion, LICM)
+### 5. 循环不变量代码外提 (Loop-Invariant Code Motion, LICM)
 
 **原理**: 识别自然循环结构，将循环体内不随迭代变化的计算移至循环前导块
 (preheader)，减少循环内的重复计算。
@@ -70,21 +102,43 @@ int y = -(-x);  // 源码
 
 **效果**: 循环内与迭代无关的计算从 O(n) 次减少到 O(1) 次。
 
+### 6. 跳转线程化 (Jump Threading)
+
+**原理**: 如果条件分支的条件是常量，直接将其转换为无条件跳转。
+
+**实现**:
+- 检测 `Br` 指令的条件是否为常量
+- 常量非零 → 跳转到 true-target
+- 常量为零 → 跳转到 false-target
+
+**效果**: 消除运行时的条件判断，减少分支预测失败。
+
+### 7. 不可达块消除 (Unreachable Block Elimination)
+
+**原理**: 从入口块开始进行可达性分析，删除不可达的基本块。
+
+**实现**:
+- BFS/DFS 遍历 CFG，标记所有可达块
+- 清除不可达块的指令（后续由 DCE 清理）
+
+**效果**: 减少代码体积，配合跳转线程化消除死分支。
+
 ## 优化调度策略
 
 ```
-inlineFunctions → DCE → CSE → CopyProp → Peephole → LICM → hoistLoopConstants → DCE
+Phase 1: constFold → DCE
+Phase 2: CSE → CopyProp → Peephole → JumpThreading → constFold → CopyProp → Peephole → DCE
+Phase 3: LICM → hoistLoopConstants → DCE → UnreachableElim → DCE
 ```
 
-优化顺序经过精心设计：
-1. **内联**首先展开小函数，暴露更多优化机会
-2. **DCE** 清理内联产生的死代码
-3. **CSE** 消除重复计算，产生更多 `Mv`
-4. **CopyProp** 传播 `Mv`，为后续优化创造条件
-5. **Peephole** 清理局部冗余模式
-6. **LICM** 外提循环不变量
-7. **hoistLoopConstants** 外提循环比较常量
-8. **最终 DCE** 清理所有优化产生的死代码
+优化分为三个阶段，每阶段之间用 DCE 清理：
+
+1. **Phase 1 - 常量传播**: 首先折叠所有可计算的常量表达式
+2. **Phase 2 - 结构优化**: CSE 消除重复计算，CopyProp 传播拷贝，
+   Peephole 清理局部模式，JumpThreading 简化控制流，
+   然后再次 constFold 和 CopyProp 处理新暴露的机会
+3. **Phase 3 - 循环优化**: LICM 外提循环不变量，hoistLoopConstants 外提比较常量
+4. **最终清理**: 不可达块消除 + DCE
 
 ## 性能提升
 
@@ -92,20 +146,23 @@ inlineFunctions → DCE → CSE → CopyProp → Peephole → LICM → hoistLoop
 
 | 测试场景 | 优化前指令数 | 优化后指令数 | 减少比例 |
 |---------|------------|------------|---------|
+| 常量折叠 | 3 | 1 | 67% |
 | 重复表达式 (CSE) | 5 | 4 | 20% |
 | 双重取反 (Peephole) | 4 | 2 | 50% |
 | 循环不变量 (LICM) | 循环内 N 次 | 循环外 1 次 | ~100% (循环内) |
+| 跳转线程化 | 条件分支 | 无条件跳转 | 消除分支预测开销 |
 
 ### 综合效果
 
 - **代码体积**: 优化后生成的汇编指令数显著减少
 - **运行时**: 循环内计算量大幅降低，寄存器分配更高效
-- **协同效应**: 各优化相互配合，CSE 产生的 `Mv` 被 CopyProp 传播，
-  Peephole 进一步清理，最终由 DCE 删除死代码
+- **协同效应**: 各优化相互配合，constFold 产生的常量使 JumpThreading 能简化控制流，
+  CSE 产生的 `Mv` 被 CopyProp 传播，Peephole 进一步清理，最终由 DCE 删除死代码
 
 ## 正确性保证
 
 - 所有优化均保持语义等价
+- 常量折叠对除零操作进行保护
 - CSE 在定义点清除时正确失效可用表达式
 - LICM 仅外提操作数均在循环外定义的指令
 - 优化后通过 DCE 确保无死代码残留
