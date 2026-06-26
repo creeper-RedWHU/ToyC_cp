@@ -826,8 +826,18 @@ void licm(IRFunc& fn) {
                 return false;   // calls, loads/stores: never hoist (side effects)
             };
 
+            // A block is "always executed" within the loop iff it dominates the
+            // latch `u` (the back-edge source, which runs on every iteration).
+            // Hoisting from a conditionally-executed block (e.g. an if/else arm)
+            // would run its definition unconditionally and, since the IR is not
+            // in SSA form, corrupt a vreg that should have kept its prior value
+            // on the not-taken path. We therefore only hoist from such
+            // always-executed blocks.
+            auto alwaysExec = [&](int b) { return dom[u][b]; };
+
             for (int b = 0; b < n; b++) {
                 if (!inLoop[b]) continue;
+                if (!alwaysExec(b)) continue;
                 std::vector<Inst> kept;
                 kept.reserve(fn.blocks[b].insts.size());
                 for (auto& in : fn.blocks[b].insts) {
