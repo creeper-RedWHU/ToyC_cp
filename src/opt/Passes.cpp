@@ -826,16 +826,10 @@ void licm(IRFunc& fn) {
                 return false;   // calls, loads/stores: never hoist (side effects)
             };
 
-            // A block's instructions only run every iteration if the block
-            // DOMINATES the loop latch `u` (the back-edge source). Blocks that
-            // sit inside a conditional arm (if/else) execute only on some
-            // iterations; hoisting from them would run the instruction
-            // unconditionally and, since the IR is non-SSA, clobber a vreg whose
-            // value should have been preserved on the not-taken path. Restrict
-            // hoisting to latch-dominating blocks.
+            // Only hoist from blocks that dominate the latch (always executed).
             for (int b = 0; b < n; b++) {
                 if (!inLoop[b]) continue;
-                if (!dom[b][u]) continue;          // must dominate the latch
+                if (!dom[b][u]) continue;
                 std::vector<Inst> kept;
                 kept.reserve(fn.blocks[b].insts.size());
                 for (auto& in : fn.blocks[b].insts) {
