@@ -400,39 +400,66 @@ void unreachableElim(IRFunc& fn) {
 }
 
 // ---- copy propagation ------------------------------------------------------
-// Replace uses of Mv destinations with their source registers, following
-// chains. DCE subsequently removes the now-dead Mv instructions.
+// Replace uses of a copy's destination with its source register, *within a
+// basic block*. The ToyC IR is NOT in SSA form: a local variable keeps one
+// vreg across reassignments (e.g. `r = r + 1` redefines r's vreg), so a copy
+// `dst = src` is only valid from the Mv up to the point where either `dst` or
+// `src` is next redefined. A global, kill-free map would wrongly propagate a
+// stale copy past a redefinition and corrupt the program. We therefore track
+// the live copy set per block and invalidate entries on every redefinition.
+// DCE subsequently removes any Mv whose destination became dead.
 bool copyProp(IRFunc& fn) {
     bool any = false;
-    std::unordered_map<int, int> copyMap;
-    for (auto& bb : fn.blocks)
-        for (auto& in : bb.insts)
-            if (in.op == Op::Mv && in.a.isReg())
-                copyMap[in.dst] = in.a.reg;
-    if (copyMap.empty()) return false;
-
-    auto resolve = [&](int v) {
-        int cur = v;
-        for (int i = 0; i < 64; i++) {
-            auto it = copyMap.find(cur);
-            if (it == copyMap.end()) break;
-            cur = it->second;
-        }
-        return cur;
-    };
-
-    auto apply = [&](Val& v) {
-        if (v.isReg()) {
-            int r = resolve(v.reg);
-            if (r != v.reg) { v.reg = r; any = true; }
-        }
-    };
 
     for (auto& bb : fn.blocks) {
+        // copy[d] = s  means "vreg d currently holds the same value as vreg s".
+        std::unordered_map<int, int> copy;
+
+        // Drop every copy invalidated by a (re)definition of vreg `d`: both
+        // copies *of* d and copies whose *source* is d.
+        auto kill = [&](int d) {
+            if (d < 0) return;
+            copy.erase(d);
+            for (auto it = copy.begin(); it != copy.end(); ) {
+                if (it->second == d) it = copy.erase(it);
+                else ++it;
+            }
+        };
+
+        // Follow a chain of copies to its root (bounded; copies form a DAG
+        // within the live set, but guard against cycles anyway).
+        auto resolve = [&](int v) {
+            int cur = v;
+            for (int i = 0; i < 64; i++) {
+                auto it = copy.find(cur);
+                if (it == copy.end()) break;
+                cur = it->second;
+            }
+            return cur;
+        };
+        auto apply = [&](Val& v) {
+            if (v.isReg()) {
+                int r = resolve(v.reg);
+                if (r != v.reg) { v.reg = r; any = true; }
+            }
+        };
+
         for (auto& in : bb.insts) {
-            if (in.op == Op::Mv) continue;
-            apply(in.a); apply(in.b);
-            for (auto& a : in.args) apply(a);
+            // Rewrite operand uses with the current copy set first.
+            if (in.op == Op::Mv) {
+                apply(in.a);
+            } else {
+                apply(in.a); apply(in.b);
+                for (auto& a : in.args) apply(a);
+            }
+
+            // Then account for this instruction's definition.
+            if (in.op == Op::Mv && in.a.isReg() && in.dst >= 0 && in.dst != in.a.reg) {
+                kill(in.dst);              // dst is being redefined
+                copy[in.dst] = in.a.reg;   // record the fresh copy
+            } else {
+                kill(in.dst);              // any other def kills copies on dst
+            }
         }
         if (bb.term == Term::Br) apply(bb.cond);
         if (bb.term == Term::Ret && bb.retHasVal) apply(bb.retVal);
@@ -518,7 +545,15 @@ bool peephole(IRFunc& fn) {
 }
 
 // ---- loop-invariant code motion (LICM) -------------------------------------
-// Hoist instructions whose operands are all defined outside the loop.
+// Hoist instructions whose operands are all loop-invariant. Because the ToyC IR
+// is NOT in SSA form, a vreg can be (re)assigned inside the loop body (e.g. the
+// induction `i = i + 1` or accumulation `s = s + i`). An operand is only truly
+// invariant if it is NEVER defined inside the loop -- being "also defined before
+// the loop" is not enough, since the in-loop definition makes it vary per
+// iteration. We therefore compute the set of vregs defined inside the loop and
+// only hoist an instruction when (a) none of its register operands is defined in
+// the loop, and (b) its own destination is defined exactly once in the loop (so
+// moving it out cannot drop other reaching definitions).
 void licm(IRFunc& fn) {
     computeCFG(fn);
     int n = (int)fn.blocks.size();
@@ -547,21 +582,28 @@ void licm(IRFunc& fn) {
             if (outside != 1) continue;
             if (fn.blocks[pre].term != Term::Jmp || fn.blocks[pre].succ0 != v) continue;
 
-            std::vector<char> definedOutside(fn.numVregs, 0);
+            // Count how many times each vreg is defined *inside* the loop.
+            std::vector<int> defCountInLoop(fn.numVregs, 0);
             for (int b = 0; b < n; b++) {
-                if (inLoop[b]) continue;
+                if (!inLoop[b]) continue;
                 for (auto& in : fn.blocks[b].insts)
-                    if (in.dst >= 0) definedOutside[in.dst] = 1;
+                    if (in.dst >= 0) defCountInLoop[in.dst]++;
             }
+            auto definedInLoop = [&](int reg) { return defCountInLoop[reg] > 0; };
 
+            // An operand is invariant iff it is an immediate or a vreg never
+            // (re)defined inside the loop.
+            auto operandInvariant = [&](const Val& v2) {
+                return !v2.isReg() || !definedInLoop(v2.reg);
+            };
             auto isInvariant = [&](const Inst& in) -> bool {
                 if (in.dst < 0) return false;
+                if (defCountInLoop[in.dst] != 1) return false;  // single def only
                 if (in.op == Op::Mv || in.op == Op::Neg || in.op == Op::Not)
-                    return !in.a.isReg() || definedOutside[in.a.reg];
+                    return operandInvariant(in.a);
                 if (isBinary(in.op))
-                    return (!in.a.isReg() || definedOutside[in.a.reg]) &&
-                           (!in.b.isReg() || definedOutside[in.b.reg]);
-                return false;
+                    return operandInvariant(in.a) && operandInvariant(in.b);
+                return false;   // calls, loads/stores: never hoist (side effects)
             };
 
             for (int b = 0; b < n; b++) {
@@ -570,8 +612,11 @@ void licm(IRFunc& fn) {
                 kept.reserve(fn.blocks[b].insts.size());
                 for (auto& in : fn.blocks[b].insts) {
                     if (isInvariant(in)) {
+                        // Once hoisted, this vreg is no longer defined in the
+                        // loop; later instructions using it stay correct because
+                        // the value is now computed once in the preheader.
+                        defCountInLoop[in.dst] = 0;
                         fn.blocks[pre].insts.push_back(in);
-                        definedOutside[in.dst] = 1;
                     } else {
                         kept.push_back(in);
                     }

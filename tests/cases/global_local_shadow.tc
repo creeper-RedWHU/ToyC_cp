@@ -3,26 +3,26 @@
 
 int x = 100;   // 全局 x
 
-int f(int x) {
-    // 参数 x 屏蔽全局 x
-    int r = x;             // 使用参数 x
+int f(int p) {
+    // 参数 p 屏蔽全局 x
+    int r = p;             // 使用参数 p
     {
-        int x = x + 1;    // 局部 x = 参数x + 1（注意初始化用参数 x）
-        r = r + x;         // r = 参数x + (参数x + 1)
+        int x = p + 1;     // 内层局部 x = 参数p + 1（用参数 p 初始化，避免自引用 UB）
+        r = r + x;         // r = p + (p + 1)
     }
-    // 此时 x 又是参数 x
-    return r + x;          // r + 参数x = 2*参数x + 1 + 参数x = 3*参数x + 1
+    // 内层块结束，x 在此处指全局 x
+    return r + x;          // (p + p + 1) + 全局x(100) = 2p + 1 + 100
 }
 
 int g(int p) {
-    int x = p * 2;         // 局部 x 屏蔽（若有）同名变量，用参数 p 初始化
+    int x = p * 2;         // 局部 x 屏蔽全局 x，用参数 p 初始化
     return x + 1;          // 局部 x + 1 = p*2 + 1
 }
 
 int main() {
-    int result_f = f(10);  // 3*10 + 1 = 31
+    int result_f = f(10);  // 2*10 + 1 + 100 = 121
     int result_g = g(5);   // 5*2 + 1 = 11
-    int local_x = x + 1;  // 全局 x = 100, local_x = 101
+    int local_x = x + 1;   // 全局 x = 100, local_x = 101
     return (result_f + result_g + local_x) % 256;
-    // 31 + 11 + 101 = 143
+    // 121 + 11 + 101 = 233
 }
