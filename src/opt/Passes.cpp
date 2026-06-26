@@ -62,7 +62,7 @@ int instCount(const IRFunc& f) {
 
 bool inlinable(const IRFunc& g) {
     return g.blocks.size() == 1 && g.blocks[0].term == Term::Ret &&
-           g.name != "main" && instCount(g) <= 24;
+           g.name != "main" && instCount(g) <= 60;
 }
 
 Val cloneVal(const Val& v, int vBase) {
@@ -116,11 +116,119 @@ bool inlineSweep(IRModule& mod, std::unordered_map<std::string, IRFunc*>& byName
     return any;
 }
 
+// ---- multi-block inlining --------------------------------------------------
+// Inline calls to small multi-block callees (if-else / short loops) by stitching
+// the callee's CFG into the caller. The caller block holding the call is split
+// at the call point: instructions before the call stay (followed by parameter
+// Mv's and a jump into the callee entry); instructions after the call move into
+// a fresh "continuation" block that inherits the original terminator. The
+// callee's blocks are appended with their block ids and vregs renamed; each
+// callee Ret becomes `Mv dst = retval` (when the call result is used) followed
+// by a jump to the continuation block. Because succ ids equal block indices,
+// appending blocks at the tail keeps id == index consistent.
+bool selfRecursive(const IRFunc& g) {
+    for (auto& bb : g.blocks)
+        for (auto& in : bb.insts)
+            if (in.op == Op::Call && in.callee && in.callee->name == g.name) return true;
+    return false;
+}
+
+bool multiInlinable(const IRFunc& g, const IRFunc& f) {
+    if (&g == &f) return false;             // never inline directly into itself
+    if (g.name == "main") return false;
+    if (g.blocks.size() < 2) return false;  // single-block handled by inlineSweep
+    if (g.blocks.size() > 8) return false;  // cap CFG growth
+    if (instCount(g) > 40) return false;    // cap code bloat
+    if (selfRecursive(g)) return false;     // never inline (self-)recursive callees
+    for (auto& bb : g.blocks)
+        if (bb.term == Term::None) return false;  // must be fully terminated
+    return true;
+}
+
+// Splice callee G into F at block bi, instruction index ci (the Call).
+void doMultiInline(IRFunc& F, int bi, int ci, const IRFunc& G) {
+    int nF = (int)F.blocks.size();
+    int vBase = F.numVregs;
+    F.numVregs += G.numVregs;
+    int contId = nF;          // continuation block appended first
+    int gBase  = nF + 1;      // callee blocks appended after it
+
+    // Copy call info before mutating B (its storage is about to change).
+    Inst call = F.blocks[bi].insts[ci];
+    int callDst = call.dst;
+
+    // Build the continuation block from B's post-call tail; it inherits B's term.
+    BasicBlock cont;
+    cont.id = contId;
+    {
+        BasicBlock& B = F.blocks[bi];
+        for (int k = ci + 1; k < (int)B.insts.size(); k++) cont.insts.push_back(B.insts[k]);
+        cont.term = B.term; cont.cond = B.cond;
+        cont.succ0 = B.succ0; cont.succ1 = B.succ1;
+        cont.retHasVal = B.retHasVal; cont.retVal = B.retVal;
+
+        // Rewrite B: keep pre-call insts, append parameter Mv's, jump to entry.
+        B.insts.resize(ci);
+        for (int j = 0; j < G.numParams; j++) {
+            Inst mv; mv.op = Op::Mv; mv.dst = G.paramRegs[j] + vBase; mv.a = call.args[j];
+            B.insts.push_back(std::move(mv));
+        }
+        B.term = Term::Jmp; B.succ0 = gBase; B.succ1 = -1;
+        B.cond = Val::I(0); B.retHasVal = false;
+    }
+
+    // Materialise the remapped callee blocks (entry is block 0 -> gBase).
+    std::vector<BasicBlock> appended;
+    appended.push_back(std::move(cont));
+    for (auto& gb : G.blocks) {
+        BasicBlock nb;
+        nb.id = gBase + gb.id;
+        for (auto& gi : gb.insts) nb.insts.push_back(cloneInst(gi, vBase));
+        if (gb.term == Term::Ret) {
+            if (callDst >= 0 && gb.retHasVal) {
+                Inst mv; mv.op = Op::Mv; mv.dst = callDst; mv.a = cloneVal(gb.retVal, vBase);
+                nb.insts.push_back(std::move(mv));
+            }
+            nb.term = Term::Jmp; nb.succ0 = contId; nb.succ1 = -1;
+        } else {
+            nb.term = gb.term;
+            nb.cond = cloneVal(gb.cond, vBase);
+            nb.succ0 = gb.succ0 >= 0 ? gBase + gb.succ0 : -1;
+            nb.succ1 = gb.succ1 >= 0 ? gBase + gb.succ1 : -1;
+        }
+        appended.push_back(std::move(nb));
+    }
+    for (auto& nb : appended) F.blocks.push_back(std::move(nb));
+    computeCFG(F);
+}
+
+// Inline the first multi-block call found in F. Returns true if one was inlined.
+bool inlineOneMulti(IRFunc& F, std::unordered_map<std::string, IRFunc*>& byName) {
+    for (int bi = 0; bi < (int)F.blocks.size(); bi++) {
+        for (int ci = 0; ci < (int)F.blocks[bi].insts.size(); ci++) {
+            const Inst& in = F.blocks[bi].insts[ci];
+            if (in.op != Op::Call || !in.callee) continue;
+            auto it = byName.find(in.callee->name);
+            if (it == byName.end()) continue;
+            IRFunc* G = it->second;
+            if (!multiInlinable(*G, F)) continue;
+            if ((int)in.args.size() != G->numParams) continue;
+            doMultiInline(F, bi, ci, *G);
+            return true;
+        }
+    }
+    return false;
+}
+
 void inlineFunctions(IRModule& mod) {
     std::unordered_map<std::string, IRFunc*> byName;
     for (auto& f : mod.funcs) byName[f.name] = &f;
-    for (int pass = 0; pass < 5; pass++)
-        if (!inlineSweep(mod, byName)) break;
+    for (int pass = 0; pass < 5; pass++) {
+        bool any = inlineSweep(mod, byName);
+        for (auto& F : mod.funcs)
+            while (inlineOneMulti(F, byName)) any = true;
+        if (!any) break;
+    }
 }
 
 // ---- dead code elimination -------------------------------------------------
