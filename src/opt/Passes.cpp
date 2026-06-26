@@ -440,12 +440,51 @@ bool copyProp(IRFunc& fn) {
     return any;
 }
 
+// ---- block-local constant propagation ------------------------------------
+// Within each basic block, propagate constants from Mv instructions to their
+// uses. This is STRICTLY block-local with kill — when a vreg is redefined the
+// constant is invalidated.  Safe for non-SSA IR.  Only propagates constants
+// that fit in 12 bits (addi/slti range) to avoid introducing extra li's.
+bool constProp(IRFunc& fn) {
+    bool any = false;
+    for (auto& bb : fn.blocks) {
+        std::unordered_map<int, int32_t> constMap;
+        std::vector<Inst> out;
+        out.reserve(bb.insts.size());
+        for (auto& in : bb.insts) {
+            if (in.dst >= 0) constMap.erase(in.dst);   // kill: redefined
+            if (in.op == Op::Mv && in.a.isImm() && in.a.imm >= -2048 && in.a.imm <= 2047) {
+                constMap[in.dst] = in.a.imm;
+                out.push_back(in);
+                continue;
+            }
+            auto apply = [&](Val& v) {
+                if (v.isReg()) {
+                    auto it = constMap.find(v.reg);
+                    if (it != constMap.end()) { v = Val::I(it->second); any = true; }
+                }
+            };
+            Inst r = in;
+            if (in.op != Op::Mv) {
+                apply(r.a); apply(r.b);
+                for (auto& a : r.args) apply(a);
+            }
+            out.push_back(r);
+        }
+        bb.insts = std::move(out);
+    }
+    return any;
+}
+
 // ---- common subexpression elimination (CSE) --------------------------------
 // Within each basic block, detect identical binary expressions and replace
-// later occurrences with the earlier result.
+// later occurrences with the earlier result. Also eliminates redundant
+// LoadGlobal (same global loaded again in the same block without intervening
+// StoreGlobal).
 bool cseBlock(BasicBlock& bb) {
     bool any = false;
     std::unordered_map<BinKey, int, BinKeyHash> avail;
+    std::unordered_map<int, int> availLoad;    // gid -> dst
     std::vector<Inst> out;
     out.reserve(bb.insts.size());
 
@@ -456,9 +495,18 @@ bool cseBlock(BasicBlock& bb) {
                 toRemove.push_back(key);
         }
         for (auto& k : toRemove) avail.erase(k);
+        // kill LoadGlobal availability if this vreg was the source
+        std::vector<int> toKillLoad;
+        for (auto& [gid, src] : availLoad)
+            if (src == d) toKillLoad.push_back(gid);
+        for (int g : toKillLoad) availLoad.erase(g);
     };
 
     for (auto& in : bb.insts) {
+        if (in.op == Op::StoreGlobal) {
+            // a StoreGlobal may modify memory — invalidate all LoadGlobal caches
+            availLoad.clear();
+        }
         if (isBinary(in.op) && in.a.isReg() && in.b.isReg()) {
             BinKey key = makeKey(in);
             auto it = avail.find(key);
@@ -470,9 +518,22 @@ bool cseBlock(BasicBlock& bb) {
                 continue;
             }
         }
+        // LoadGlobal CSE: reuse earlier load of the same global
+        if (in.op == Op::LoadGlobal && in.dst >= 0) {
+            auto it = availLoad.find(in.gid);
+            if (it != availLoad.end()) {
+                Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = Val::R(it->second);
+                out.push_back(std::move(mv));
+                killDef(in.dst);
+                any = true;
+                continue;
+            }
+        }
         if (in.dst >= 0) killDef(in.dst);
         if (isBinary(in.op) && in.a.isReg() && in.b.isReg())
             avail[makeKey(in)] = in.dst;
+        if (in.op == Op::LoadGlobal && in.dst >= 0)
+            availLoad[in.gid] = in.dst;
         out.push_back(in);
     }
     bb.insts = std::move(out);
@@ -587,7 +648,8 @@ void licm(IRFunc& fn) {
 void optimizeIR(IRModule& mod, bool opt) {
     if (opt) inlineFunctions(mod);
     for (auto& fn : mod.funcs) {
-        // Phase 1: constant folding + algebraic simplification
+        // Phase 1: constant propagation + folding
+        if (opt) constProp(fn);
         if (opt) constFold(fn);
         deadCodeElim(fn);
 

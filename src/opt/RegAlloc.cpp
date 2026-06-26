@@ -130,10 +130,21 @@ Allocation allocateRegisters(const IRFunc& fn) {
     }
 
     // ----- greedy colouring with move bias -----------------------------------
+    // Compute total use count per vreg — spill cost heuristic: vregs used more
+    // often are more expensive to spill, so they get priority in the order.
+    std::vector<int> useTotal(nv, 0);
+    for (int b = 0; b < nb; b++)
+        for (int v = 0; v < nv; v++)
+            if (useB[b][v]) useTotal[v]++;
+
     std::vector<int> order(nv);
     for (int i = 0; i < nv; i++) order[i] = i;
     std::sort(order.begin(), order.end(), [&](int a, int b) {
-        return adj[a].size() > adj[b].size();
+        // Primary: more interference edges → higher priority
+        // Secondary: more total uses → higher spill cost → higher priority
+        size_t da = adj[a].size(), db = adj[b].size();
+        if (da != db) return da > db;
+        return useTotal[a] > useTotal[b];
     });
 
     const auto& caller = callerSavedPool();
