@@ -2,9 +2,11 @@
 # 用 spike histogram (-g) 测每个 benchmark 的动态指令总数。
 # 平台无关、零噪声指标：指令越少越好。对比本编译器 -opt 与 gcc -O2。
 set -u
-cd /mnt/d/Toc/branches/develop
+# 自动定位脚本所在仓库根（tests/ 的上一级），保证在任意 worktree 中都测本分支的编译器
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 RT=runtime
-SPIKE=/usr/local/bin/spike
+SPIKE="${SPIKE:-/usr/local/bin/spike}"
 LINK="-march=rv32im -mabi=ilp32 -nostdlib -nostartfiles -T $RT/link.ld"
 
 # 求 histogram 指令总数：spike -g 输出 "PC 次数"，对第二列求和
