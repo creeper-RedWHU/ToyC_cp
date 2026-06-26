@@ -34,6 +34,8 @@ struct Inst {
     int gid = -1;                 // LoadGlobal / StoreGlobal
     FuncDef* callee = nullptr;    // Call
     std::vector<Val> args;        // Call
+    int magicVreg = -1;           // Codegen hint: pre-computed magic number for Div/Mod by constant
+    bool unsignedDiv = false;     // Codegen hint: dividend is non-negative, use unsigned magic division
 };
 
 enum class Term { None, Jmp, Br, Ret };

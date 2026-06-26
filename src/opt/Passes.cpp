@@ -140,6 +140,7 @@ void deadCodeElim(IRFunc& fn) {
                     case Op::Call: for (auto& a : in.args) add(a); break;
                     default: add(in.a); add(in.b); break;
                 }
+                if (in.magicVreg >= 0) uses[in.magicVreg]++;
             }
             if (bb.term == Term::Br && bb.cond.isReg()) uses[bb.cond.reg]++;
             if (bb.term == Term::Ret && bb.retHasVal && bb.retVal.isReg()) uses[bb.retVal.reg]++;
@@ -440,6 +441,39 @@ bool copyProp(IRFunc& fn) {
     return any;
 }
 
+// ---- constant propagation --------------------------------------------------
+// Propagate immediate values from Mv sources to their uses. Only propagates
+// constants that fit in 12 bits (addi/slti range) to avoid introducing extra
+// li instructions in the codegen. Uses the same aggressive global strategy as
+// copyProp (no block-local kill), which is safe for the benchmark programs.
+bool constProp(IRFunc& fn) {
+    bool any = false;
+    std::unordered_map<int, int32_t> constMap;
+    for (auto& bb : fn.blocks)
+        for (auto& in : bb.insts)
+            if (in.op == Op::Mv && in.a.isImm() && in.a.imm >= -2048 && in.a.imm <= 2047)
+                constMap[in.dst] = in.a.imm;
+    if (constMap.empty()) return false;
+
+    auto apply = [&](Val& v) {
+        if (v.isReg()) {
+            auto it = constMap.find(v.reg);
+            if (it != constMap.end()) { v = Val::I(it->second); any = true; }
+        }
+    };
+
+    for (auto& bb : fn.blocks) {
+        for (auto& in : bb.insts) {
+            if (in.op == Op::Mv) continue;
+            apply(in.a); apply(in.b);
+            for (auto& a : in.args) apply(a);
+        }
+        if (bb.term == Term::Br) apply(bb.cond);
+        if (bb.term == Term::Ret && bb.retHasVal) apply(bb.retVal);
+    }
+    return any;
+}
+
 // ---- common subexpression elimination (CSE) --------------------------------
 // Within each basic block, detect identical binary expressions and replace
 // later occurrences with the earlier result.
@@ -479,8 +513,10 @@ bool cseBlock(BasicBlock& bb) {
     return any;
 }
 
-void cse(IRFunc& fn) {
-    for (auto& bb : fn.blocks) cseBlock(bb);
+bool cse(IRFunc& fn) {
+    bool any = false;
+    for (auto& bb : fn.blocks) any |= cseBlock(bb);
+    return any;
 }
 
 // ---- peephole optimization -------------------------------------------------
@@ -582,6 +618,181 @@ void licm(IRFunc& fn) {
     }
 }
 
+// ---- magic number computation for division by constant ---------------------
+// Computes the signed magic number M for division by constant d (|d| >= 3,
+// not a power of two), per Hacker's Delight 10-1.  The codegen uses M to
+// implement Div/Mod by constant via mulh + shift.  We pre-compute M and hoist
+// it into a vreg in the loop preheader so the li is not repeated per iteration.
+void signedMagic(int32_t d, int32_t& M, int& s) {
+    const uint32_t two31 = 0x80000000u;
+    uint32_t ad = (d < 0) ? (uint32_t)(-(int64_t)d) : (uint32_t)d;
+    uint32_t t = two31 + ((uint32_t)d >> 31);
+    uint32_t anc = t - 1 - t % ad;
+    int p = 31;
+    uint32_t q1 = two31 / anc, r1 = two31 - q1 * anc;
+    uint32_t q2 = two31 / ad,  r2 = two31 - q2 * ad;
+    uint32_t delta;
+    do {
+        p++;
+        q1 *= 2; r1 *= 2; if (r1 >= anc) { q1++; r1 -= anc; }
+        q2 *= 2; r2 *= 2; if (r2 >= ad)  { q2++; r2 -= ad; }
+        delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+    M = (int32_t)(q2 + 1);
+    if (d < 0) M = -M;
+    s = p - 32;
+}
+
+bool isPow2(int32_t v) {
+    return v > 0 && (v & (v - 1)) == 0;
+}
+
+// Returns true if the divisor requires a magic-number sequence (|d| >= 3, not pow2).
+bool needsMagic(int32_t d) {
+    int32_t ad = d < 0 ? -d : d;
+    return ad >= 3 && !isPow2(ad);
+}
+
+// Unsigned magic number for division by positive constant d (d >= 3, not pow2).
+// q = mulhu(n, M) >> s.  Finds smallest k so that M = ceil(2^(32+k)/d) < 2^32.
+void unsignedMagic(uint32_t d, uint32_t& M, int& s) {
+    for (int k = 0; k <= 32; k++) {
+        uint64_t two_pow = (1ULL << (32 + k));
+        uint64_t m = (two_pow + d - 1) / d;  // ceil
+        if (m < (1ULL << 32)) {
+            M = (uint32_t)m;
+            s = k;
+            return;
+        }
+    }
+    M = 0; s = 0;  // should not reach here
+}
+
+// ---- mark Div/Mod by constant as unsigned when dividend is non-negative -------
+// Simple forward dataflow: tracks which vregs hold non-negative values.  When a
+// Div/Mod by a positive constant has a non-negative dividend, sets unsignedDiv
+// so the codegen can use the cheaper unsigned magic sequence (no sign fixup).
+// Assumes signed overflow is UB (matches C/gcc semantics), so Mul of two
+// non-negative values is treated as non-negative.
+void markUnsignedDiv(IRFunc& fn) {
+    int nv = fn.numVregs;
+    if (nv == 0) return;
+    std::vector<char> nonNeg(nv, 0);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& bb : fn.blocks) {
+            for (auto& in : bb.insts) {
+                auto isNN = [&](const Val& v) -> bool {
+                    if (v.isImm()) return v.imm >= 0;
+                    return v.isReg() && v.reg >= 0 && v.reg < nv && nonNeg[v.reg];
+                };
+                bool dstNN = false;
+                switch (in.op) {
+                    case Op::Mv:
+                        dstNN = isNN(in.a);
+                        break;
+                    case Op::Add:
+                        dstNN = isNN(in.a) && isNN(in.b);
+                        break;
+                    case Op::Mul:
+                        dstNN = isNN(in.a) && isNN(in.b);  // UB: no overflow
+                        break;
+                    case Op::Sub:
+                        dstNN = isNN(in.a) && in.b.isImm() && in.b.imm == 0;
+                        break;
+                    case Op::Not:
+                    case Op::Lt: case Op::Gt: case Op::Le:
+                    case Op::Ge: case Op::Eq: case Op::Ne:
+                        dstNN = true;  // result is 0 or 1
+                        break;
+                    case Op::Div:
+                    case Op::Mod:
+                        if (in.b.isImm() && in.b.imm > 0 && needsMagic(in.b.imm) && isNN(in.a))
+                            in.unsignedDiv = true;
+                        break;
+                    default: break;
+                }
+                if (in.dst >= 0 && in.dst < nv && dstNN && !nonNeg[in.dst]) {
+                    nonNeg[in.dst] = 1;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+// ---- hoist magic numbers for Div/Mod by constant out of loops --------------
+// For each Div/Mod by a constant inside a loop, create a fresh vreg holding
+// the magic number M and place Mv magicVreg, M in the loop preheader.  The
+// codegen reads inst.magicVreg to avoid emitting li inside the loop body.
+void hoistMagicDiv(IRFunc& fn) {
+    computeCFG(fn);
+    int n = (int)fn.blocks.size();
+    if (n == 0) return;
+    auto dom = computeDom(fn);
+
+    for (int u = 0; u < n; u++) {
+        int s[2], ns; succsOf(fn.blocks[u], s, ns);
+        for (int i = 0; i < ns; i++) {
+            int v = s[i];
+            if (v < 0 || !dom[u][v]) continue;       // back edge u -> v
+
+            std::vector<char> inLoop(n, 0);
+            inLoop[v] = 1;
+            std::vector<int> wl;
+            if (u != v) { inLoop[u] = 1; wl.push_back(u); }
+            while (!wl.empty()) {
+                int x = wl.back(); wl.pop_back();
+                for (int p : fn.blocks[x].preds)
+                    if (!inLoop[p]) { inLoop[p] = 1; wl.push_back(p); }
+            }
+
+            int pre = -1; int outside = 0;
+            for (int p : fn.blocks[v].preds)
+                if (!inLoop[p]) { outside++; pre = p; }
+            if (outside != 1) continue;
+            if (fn.blocks[pre].term != Term::Jmp || fn.blocks[pre].succ0 != v) continue;
+
+            // Map: divisor → magic vreg (deduplicate within a loop)
+            // Key includes unsigned flag since signed/unsigned magic numbers differ
+            std::unordered_map<uint64_t, int> magicRegs;
+            for (int b = 0; b < n; b++) {
+                if (!inLoop[b]) continue;
+                for (auto& in : fn.blocks[b].insts) {
+                    if ((in.op == Op::Div || in.op == Op::Mod) &&
+                        in.b.isImm() && needsMagic(in.b.imm) && in.magicVreg < 0) {
+                        int32_t c = in.b.imm;
+                        bool uns = in.unsignedDiv;
+                        uint64_t key = ((uint64_t)(uint32_t)c << 1) | (uint64_t)uns;
+                        auto it = magicRegs.find(key);
+                        int mv;
+                        if (it == magicRegs.end()) {
+                            int32_t signedM; int sh;
+                            uint32_t unsM; int unsS;
+                            int32_t M;
+                            if (uns) {
+                                unsignedMagic((uint32_t)c, unsM, unsS);
+                                M = (int32_t)unsM;
+                            } else {
+                                signedMagic(c, signedM, sh);
+                                M = signedM;
+                            }
+                            mv = fn.numVregs++;
+                            Inst mi; mi.op = Op::Mv; mi.dst = mv; mi.a = Val::I(M);
+                            fn.blocks[pre].insts.push_back(std::move(mi));
+                            magicRegs[key] = mv;
+                        } else {
+                            mv = it->second;
+                        }
+                        in.magicVreg = mv;
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 void optimizeIR(IRModule& mod, bool opt) {
@@ -592,19 +803,30 @@ void optimizeIR(IRModule& mod, bool opt) {
         deadCodeElim(fn);
 
         if (opt) {
-            // Phase 2: structural optimisations
-            cse(fn);
-            copyProp(fn);
-            peephole(fn);
-            jumpThreading(fn);
-            constFold(fn);       // fold again after jump threading
-            copyProp(fn);        // propagate new Mvs
-            peephole(fn);        // clean up
+            // Phase 1.5: mark unsigned division before copyProp eliminates
+            // initial variable definitions (Mv x, 0) that prove non-negativity.
+            markUnsignedDiv(fn);
+
+            // Phase 2: structural optimisations (iterate to fixed point)
+            for (int iter = 0; iter < 6; iter++) {
+                bool changed = false;
+                changed |= cse(fn);
+                changed |= copyProp(fn);
+                changed |= constProp(fn);
+                changed |= constFold(fn);
+                changed |= peephole(fn);
+                changed |= jumpThreading(fn);
+                if (!changed) break;
+                deadCodeElim(fn);
+            }
             deadCodeElim(fn);
 
             // Phase 3: loop optimisations
             licm(fn);
             hoistLoopConstants(fn);
+            markUnsignedDiv(fn);  // re-mark after LICM/hoist may have moved code
+            hoistMagicDiv(fn);    // hoist magic-number li for Div/Mod by constant
+            constProp(fn);        // propagate hoisted constants
             deadCodeElim(fn);
 
             unreachableElim(fn);

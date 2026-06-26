@@ -17,6 +17,7 @@ void instUses(const Inst& in, std::vector<int>& out) {
         case Op::Call: for (auto& a : in.args) addV(a); break;
         default: addV(in.a); addV(in.b); break;   // binary
     }
+    if (in.magicVreg >= 0) out.push_back(in.magicVreg);
 }
 
 int instDef(const Inst& in) { return in.dst; }   // -1 when none
