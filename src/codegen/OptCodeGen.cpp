@@ -458,19 +458,6 @@ private:
         if (ac == 1) { out_ << "  li " << D << ", 0\n"; return; }
         int k = log2exact(ac);
         if (k >= 1) {
-            uint32_t mask = ac - 1;            // 2^k - 1
-            // Signed n % 2^k:  bias = (n<0)?(2^k-1):0;  r = ((n+bias) & mask) - bias.
-            // When the mask fits in a 12-bit immediate this is one `andi` instead
-            // of the `srai;slli` clear-low-bits pair, saving one instruction per
-            // modulo. `bias` is kept in a6 (a scratch arg reg, as elsewhere here).
-            if (fits12((long)mask)) {
-                std::string Bz = regName(X_A6);
-                emitPow2Bias(Bz, R, k);                              // a6 = bias
-                out_ << "  add "  << S << ", " << R << ", " << Bz << "\n"; // n + bias
-                out_ << "  andi " << S << ", " << S << ", " << mask << "\n";
-                out_ << "  sub "  << D << ", " << S << ", " << Bz << "\n";
-                return;
-            }
             emitPow2Bias(S, R, k);
             out_ << "  add "  << S << ", " << R << ", " << S << "\n";
             out_ << "  srai " << S << ", " << S << ", " << k << "\n";

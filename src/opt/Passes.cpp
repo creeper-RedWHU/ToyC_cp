@@ -62,7 +62,7 @@ int instCount(const IRFunc& f) {
 
 bool inlinable(const IRFunc& g) {
     return g.blocks.size() == 1 && g.blocks[0].term == Term::Ret &&
-           g.name != "main" && instCount(g) <= 60;
+           g.name != "main" && instCount(g) <= 24;
 }
 
 Val cloneVal(const Val& v, int vBase) {
@@ -116,231 +116,11 @@ bool inlineSweep(IRModule& mod, std::unordered_map<std::string, IRFunc*>& byName
     return any;
 }
 
-// ---- multi-block inlining --------------------------------------------------
-// Inline calls to small multi-block callees (if-else / short loops) by stitching
-// the callee's CFG into the caller. The caller block holding the call is split
-// at the call point: instructions before the call stay (followed by parameter
-// Mv's and a jump into the callee entry); instructions after the call move into
-// a fresh "continuation" block that inherits the original terminator. The
-// callee's blocks are appended with their block ids and vregs renamed; each
-// callee Ret becomes `Mv dst = retval` (when the call result is used) followed
-// by a jump to the continuation block. Because succ ids equal block indices,
-// appending blocks at the tail keeps id == index consistent.
-bool selfRecursive(const IRFunc& g) {
-    for (auto& bb : g.blocks)
-        for (auto& in : bb.insts)
-            if (in.op == Op::Call && in.callee && in.callee->name == g.name) return true;
-    return false;
-}
-
-bool multiInlinable(const IRFunc& g, const IRFunc& f) {
-    if (&g == &f) return false;             // never inline directly into itself
-    if (g.name == "main") return false;
-    if (g.blocks.size() < 2) return false;  // single-block handled by inlineSweep
-    if (g.blocks.size() > 8) return false;  // cap CFG growth
-    if (instCount(g) > 40) return false;    // cap code bloat
-    if (selfRecursive(g)) return false;     // never inline (self-)recursive callees
-    for (auto& bb : g.blocks)
-        if (bb.term == Term::None) return false;  // must be fully terminated
-    return true;
-}
-
-// Splice callee G into F at block bi, instruction index ci (the Call).
-void doMultiInline(IRFunc& F, int bi, int ci, const IRFunc& G) {
-    int nF = (int)F.blocks.size();
-    int vBase = F.numVregs;
-    F.numVregs += G.numVregs;
-    int contId = nF;          // continuation block appended first
-    int gBase  = nF + 1;      // callee blocks appended after it
-
-    // Copy call info before mutating B (its storage is about to change).
-    Inst call = F.blocks[bi].insts[ci];
-    int callDst = call.dst;
-
-    // Build the continuation block from B's post-call tail; it inherits B's term.
-    BasicBlock cont;
-    cont.id = contId;
-    {
-        BasicBlock& B = F.blocks[bi];
-        for (int k = ci + 1; k < (int)B.insts.size(); k++) cont.insts.push_back(B.insts[k]);
-        cont.term = B.term; cont.cond = B.cond;
-        cont.succ0 = B.succ0; cont.succ1 = B.succ1;
-        cont.retHasVal = B.retHasVal; cont.retVal = B.retVal;
-
-        // Rewrite B: keep pre-call insts, append parameter Mv's, jump to entry.
-        B.insts.resize(ci);
-        for (int j = 0; j < G.numParams; j++) {
-            Inst mv; mv.op = Op::Mv; mv.dst = G.paramRegs[j] + vBase; mv.a = call.args[j];
-            B.insts.push_back(std::move(mv));
-        }
-        B.term = Term::Jmp; B.succ0 = gBase; B.succ1 = -1;
-        B.cond = Val::I(0); B.retHasVal = false;
-    }
-
-    // Materialise the remapped callee blocks (entry is block 0 -> gBase).
-    std::vector<BasicBlock> appended;
-    appended.push_back(std::move(cont));
-    for (auto& gb : G.blocks) {
-        BasicBlock nb;
-        nb.id = gBase + gb.id;
-        for (auto& gi : gb.insts) nb.insts.push_back(cloneInst(gi, vBase));
-        if (gb.term == Term::Ret) {
-            if (callDst >= 0 && gb.retHasVal) {
-                Inst mv; mv.op = Op::Mv; mv.dst = callDst; mv.a = cloneVal(gb.retVal, vBase);
-                nb.insts.push_back(std::move(mv));
-            }
-            nb.term = Term::Jmp; nb.succ0 = contId; nb.succ1 = -1;
-        } else {
-            nb.term = gb.term;
-            nb.cond = cloneVal(gb.cond, vBase);
-            nb.succ0 = gb.succ0 >= 0 ? gBase + gb.succ0 : -1;
-            nb.succ1 = gb.succ1 >= 0 ? gBase + gb.succ1 : -1;
-        }
-        appended.push_back(std::move(nb));
-    }
-    for (auto& nb : appended) F.blocks.push_back(std::move(nb));
-    computeCFG(F);
-}
-
-// Inline the first multi-block call found in F. Returns true if one was inlined.
-bool inlineOneMulti(IRFunc& F, std::unordered_map<std::string, IRFunc*>& byName) {
-    for (int bi = 0; bi < (int)F.blocks.size(); bi++) {
-        for (int ci = 0; ci < (int)F.blocks[bi].insts.size(); ci++) {
-            const Inst& in = F.blocks[bi].insts[ci];
-            if (in.op != Op::Call || !in.callee) continue;
-            auto it = byName.find(in.callee->name);
-            if (it == byName.end()) continue;
-            IRFunc* G = it->second;
-            if (!multiInlinable(*G, F)) continue;
-            if ((int)in.args.size() != G->numParams) continue;
-            doMultiInline(F, bi, ci, *G);
-            return true;
-        }
-    }
-    return false;
-}
-
 void inlineFunctions(IRModule& mod) {
     std::unordered_map<std::string, IRFunc*> byName;
     for (auto& f : mod.funcs) byName[f.name] = &f;
-    for (int pass = 0; pass < 5; pass++) {
-        bool any = inlineSweep(mod, byName);
-        for (auto& F : mod.funcs)
-            while (inlineOneMulti(F, byName)) any = true;
-        if (!any) break;
-    }
-}
-
-// ---- global constant-store forwarding --------------------------------------
-// Intraprocedural, dominance-respecting forwarding of globals that currently
-// hold a known constant. The ToyC IR is NOT in SSA form and globals are mutable
-// shared state, so we run a forward dataflow analysis over a 3-valued lattice
-// per global:  Top (no info yet) > Const(c) > Bottom (varies / unknown).
-//
-//   StoreGlobal gid, imm  -> gid = Const(imm)
-//   StoreGlobal gid, reg  -> gid = Bottom
-//   Call                  -> ALL globals = Bottom (callee may write any)
-//   LoadGlobal gid -> dst -> if gid is Const(c), rewrite to `Mv dst, c`
-//
-// The meet over predecessors is the lattice meet (Const(c) survives only if
-// every predecessor agrees on the same c; disagreement -> Bottom). Crucially we
-// initialise every block's OUT to Top (optimistic) and the entry IN to Bottom
-// (a function may be entered with globals in any state -- always sound), then
-// iterate to a fixpoint. Optimistic Top init is what lets a constant store in
-// the loop preheader reach loads inside the loop body: a pessimistic empty init
-// would let the back-edge's empty state intersect the header down to nothing on
-// the first pass. The big win lands after inlining, when a callee's reads sit in
-// the same function as the constant stores (p11: `G = k` in main, hot loop reads
-// G via the inlined `compute`).
-enum class CState { Top, Const, Bottom };
-struct Cell {
-    CState s = CState::Top;
-    int32_t c = 0;
-    bool operator==(const Cell& o) const {
-        return s == o.s && (s != CState::Const || c == o.c);
-    }
-    bool operator!=(const Cell& o) const { return !(*this == o); }
-};
-using GMap = std::map<int, Cell>;   // absent key == Top
-
-static Cell meetCell(const Cell& a, const Cell& b) {
-    if (a.s == CState::Top) return b;
-    if (b.s == CState::Top) return a;
-    if (a.s == CState::Bottom || b.s == CState::Bottom) return {CState::Bottom, 0};
-    // both Const
-    if (a.c == b.c) return a;
-    return {CState::Bottom, 0};
-}
-
-// Meet of predecessors' OUT states. Absent in a map means Top, so a gid present
-// in any predecessor must be met against Top (identity) for the others.
-static GMap meetPreds(const std::vector<GMap>& out, const std::vector<int>& preds) {
-    GMap r;
-    for (int p : preds)
-        for (auto& [gid, cell] : out[p]) {
-            auto it = r.find(gid);
-            if (it == r.end()) r[gid] = cell;       // Top ∧ cell = cell
-            else it->second = meetCell(it->second, cell);
-        }
-    return r;
-}
-
-static void transferGlobals(const BasicBlock& bb, GMap& st) {
-    for (auto& in : bb.insts) {
-        if (in.op == Op::Call) {
-            for (auto& [gid, cell] : st) cell = {CState::Bottom, 0};
-        } else if (in.op == Op::StoreGlobal) {
-            if (in.a.isImm()) st[in.gid] = {CState::Const, in.a.imm};
-            else st[in.gid] = {CState::Bottom, 0};
-        }
-    }
-}
-
-bool globalConstProp(IRFunc& fn) {
-    computeCFG(fn);
-    int n = (int)fn.blocks.size();
-    if (n == 0) return false;
-
-    // Globals referenced anywhere in this function: at entry they are unknown.
-    GMap entryIn;
-    for (auto& bb : fn.blocks)
-        for (auto& in : bb.insts)
-            if (in.op == Op::LoadGlobal || in.op == Op::StoreGlobal)
-                entryIn[in.gid] = {CState::Bottom, 0};
-    if (entryIn.empty()) return false;
-
-    std::vector<GMap> in(n), out(n);   // OUT starts Top (empty map) = optimistic
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int b = 0; b < n; b++) {
-            GMap ni = (b == 0) ? entryIn : meetPreds(out, fn.blocks[b].preds);
-            in[b] = ni;
-            transferGlobals(fn.blocks[b], ni);
-            if (ni != out[b]) { out[b] = std::move(ni); changed = true; }
-        }
-    }
-
-    bool any = false;
-    for (int b = 0; b < n; b++) {
-        GMap st = in[b];
-        for (auto& inst : fn.blocks[b].insts) {
-            if (inst.op == Op::LoadGlobal) {
-                auto it = st.find(inst.gid);
-                if (it != st.end() && it->second.s == CState::Const) {
-                    inst.op = Op::Mv; inst.a = Val::I(it->second.c);
-                    inst.gid = -1;
-                    any = true;
-                }
-            } else if (inst.op == Op::Call) {
-                for (auto& [gid, cell] : st) cell = {CState::Bottom, 0};
-            } else if (inst.op == Op::StoreGlobal) {
-                if (inst.a.isImm()) st[inst.gid] = {CState::Const, inst.a.imm};
-                else st[inst.gid] = {CState::Bottom, 0};
-            }
-        }
-    }
-    return any;
+    for (int pass = 0; pass < 5; pass++)
+        if (!inlineSweep(mod, byName)) break;
 }
 
 // ---- dead code elimination -------------------------------------------------
@@ -620,66 +400,39 @@ void unreachableElim(IRFunc& fn) {
 }
 
 // ---- copy propagation ------------------------------------------------------
-// Replace uses of a copy's destination with its source register, *within a
-// basic block*. The ToyC IR is NOT in SSA form: a local variable keeps one
-// vreg across reassignments (e.g. `r = r + 1` redefines r's vreg), so a copy
-// `dst = src` is only valid from the Mv up to the point where either `dst` or
-// `src` is next redefined. A global, kill-free map would wrongly propagate a
-// stale copy past a redefinition and corrupt the program. We therefore track
-// the live copy set per block and invalidate entries on every redefinition.
-// DCE subsequently removes any Mv whose destination became dead.
+// Replace uses of Mv destinations with their source registers, following
+// chains. DCE subsequently removes the now-dead Mv instructions.
 bool copyProp(IRFunc& fn) {
     bool any = false;
+    std::unordered_map<int, int> copyMap;
+    for (auto& bb : fn.blocks)
+        for (auto& in : bb.insts)
+            if (in.op == Op::Mv && in.a.isReg())
+                copyMap[in.dst] = in.a.reg;
+    if (copyMap.empty()) return false;
+
+    auto resolve = [&](int v) {
+        int cur = v;
+        for (int i = 0; i < 64; i++) {
+            auto it = copyMap.find(cur);
+            if (it == copyMap.end()) break;
+            cur = it->second;
+        }
+        return cur;
+    };
+
+    auto apply = [&](Val& v) {
+        if (v.isReg()) {
+            int r = resolve(v.reg);
+            if (r != v.reg) { v.reg = r; any = true; }
+        }
+    };
 
     for (auto& bb : fn.blocks) {
-        // copy[d] = s  means "vreg d currently holds the same value as vreg s".
-        std::unordered_map<int, int> copy;
-
-        // Drop every copy invalidated by a (re)definition of vreg `d`: both
-        // copies *of* d and copies whose *source* is d.
-        auto kill = [&](int d) {
-            if (d < 0) return;
-            copy.erase(d);
-            for (auto it = copy.begin(); it != copy.end(); ) {
-                if (it->second == d) it = copy.erase(it);
-                else ++it;
-            }
-        };
-
-        // Follow a chain of copies to its root (bounded; copies form a DAG
-        // within the live set, but guard against cycles anyway).
-        auto resolve = [&](int v) {
-            int cur = v;
-            for (int i = 0; i < 64; i++) {
-                auto it = copy.find(cur);
-                if (it == copy.end()) break;
-                cur = it->second;
-            }
-            return cur;
-        };
-        auto apply = [&](Val& v) {
-            if (v.isReg()) {
-                int r = resolve(v.reg);
-                if (r != v.reg) { v.reg = r; any = true; }
-            }
-        };
-
         for (auto& in : bb.insts) {
-            // Rewrite operand uses with the current copy set first.
-            if (in.op == Op::Mv) {
-                apply(in.a);
-            } else {
-                apply(in.a); apply(in.b);
-                for (auto& a : in.args) apply(a);
-            }
-
-            // Then account for this instruction's definition.
-            if (in.op == Op::Mv && in.a.isReg() && in.dst >= 0 && in.dst != in.a.reg) {
-                kill(in.dst);              // dst is being redefined
-                copy[in.dst] = in.a.reg;   // record the fresh copy
-            } else {
-                kill(in.dst);              // any other def kills copies on dst
-            }
+            if (in.op == Op::Mv) continue;
+            apply(in.a); apply(in.b);
+            for (auto& a : in.args) apply(a);
         }
         if (bb.term == Term::Br) apply(bb.cond);
         if (bb.term == Term::Ret && bb.retHasVal) apply(bb.retVal);
@@ -765,15 +518,7 @@ bool peephole(IRFunc& fn) {
 }
 
 // ---- loop-invariant code motion (LICM) -------------------------------------
-// Hoist instructions whose operands are all loop-invariant. Because the ToyC IR
-// is NOT in SSA form, a vreg can be (re)assigned inside the loop body (e.g. the
-// induction `i = i + 1` or accumulation `s = s + i`). An operand is only truly
-// invariant if it is NEVER defined inside the loop -- being "also defined before
-// the loop" is not enough, since the in-loop definition makes it vary per
-// iteration. We therefore compute the set of vregs defined inside the loop and
-// only hoist an instruction when (a) none of its register operands is defined in
-// the loop, and (b) its own destination is defined exactly once in the loop (so
-// moving it out cannot drop other reaching definitions).
+// Hoist instructions whose operands are all defined outside the loop.
 void licm(IRFunc& fn) {
     computeCFG(fn);
     int n = (int)fn.blocks.size();
@@ -802,43 +547,31 @@ void licm(IRFunc& fn) {
             if (outside != 1) continue;
             if (fn.blocks[pre].term != Term::Jmp || fn.blocks[pre].succ0 != v) continue;
 
-            // Count how many times each vreg is defined *inside* the loop.
-            std::vector<int> defCountInLoop(fn.numVregs, 0);
+            std::vector<char> definedOutside(fn.numVregs, 0);
             for (int b = 0; b < n; b++) {
-                if (!inLoop[b]) continue;
+                if (inLoop[b]) continue;
                 for (auto& in : fn.blocks[b].insts)
-                    if (in.dst >= 0) defCountInLoop[in.dst]++;
+                    if (in.dst >= 0) definedOutside[in.dst] = 1;
             }
-            auto definedInLoop = [&](int reg) { return defCountInLoop[reg] > 0; };
 
-            // An operand is invariant iff it is an immediate or a vreg never
-            // (re)defined inside the loop.
-            auto operandInvariant = [&](const Val& v2) {
-                return !v2.isReg() || !definedInLoop(v2.reg);
-            };
             auto isInvariant = [&](const Inst& in) -> bool {
                 if (in.dst < 0) return false;
-                if (defCountInLoop[in.dst] != 1) return false;  // single def only
                 if (in.op == Op::Mv || in.op == Op::Neg || in.op == Op::Not)
-                    return operandInvariant(in.a);
+                    return !in.a.isReg() || definedOutside[in.a.reg];
                 if (isBinary(in.op))
-                    return operandInvariant(in.a) && operandInvariant(in.b);
-                return false;   // calls, loads/stores: never hoist (side effects)
+                    return (!in.a.isReg() || definedOutside[in.a.reg]) &&
+                           (!in.b.isReg() || definedOutside[in.b.reg]);
+                return false;
             };
 
-            // Only hoist from blocks that dominate the latch (always executed).
             for (int b = 0; b < n; b++) {
                 if (!inLoop[b]) continue;
-                if (!dom[b][u]) continue;
                 std::vector<Inst> kept;
                 kept.reserve(fn.blocks[b].insts.size());
                 for (auto& in : fn.blocks[b].insts) {
                     if (isInvariant(in)) {
-                        // Once hoisted, this vreg is no longer defined in the
-                        // loop; later instructions using it stay correct because
-                        // the value is now computed once in the preheader.
-                        defCountInLoop[in.dst] = 0;
                         fn.blocks[pre].insts.push_back(in);
+                        definedOutside[in.dst] = 1;
                     } else {
                         kept.push_back(in);
                     }
@@ -849,67 +582,17 @@ void licm(IRFunc& fn) {
     }
 }
 
-// ---- self tail-call elimination --------------------------------------------
-// Rewrite `return self(args);` into a jump back to the function entry, updating
-// the parameter vregs in place — turning self tail recursion into a loop and
-// dropping the per-call stack-frame setup/teardown. ToyC forbids mutual
-// recursion and forward calls, so only direct self-recursion can occur; we
-// match it by name (function names are unique). The entry block (index 0)
-// becomes the loop header: jumping to its label re-enters the body after the
-// prologue, re-reading the (updated) parameter vregs. Locals are recomputed
-// each iteration, which is exactly the call semantics. Because the entry block
-// has no predecessor outside the loop, LICM/const-hoist (which require a single
-// outside preheader) correctly skip this loop.
-void tailCallElim(IRFunc& fn) {
-    if (fn.blocks.empty()) return;
-    bool any = false;
-    for (auto& bb : fn.blocks) {
-        if (bb.term != Term::Ret || !bb.retHasVal || bb.insts.empty()) continue;
-        Inst& call = bb.insts.back();
-        if (call.op != Op::Call || !call.callee || call.callee->name != fn.name) continue;
-        if (call.dst < 0 || !bb.retVal.isReg() || bb.retVal.reg != call.dst) continue;
-        if ((int)call.args.size() != fn.numParams) continue;
-
-        // 1. Evaluate every argument into a fresh temp first, so swaps like
-        //    f(b, a) don't clobber a parameter before it has been read.
-        std::vector<Val> args = call.args;     // copy before we drop the Call
-        std::vector<int> tmp(fn.numParams);
-        bb.insts.pop_back();                   // remove the tail Call
-        for (int i = 0; i < fn.numParams; i++) {
-            tmp[i] = fn.numVregs++;
-            Inst mv; mv.op = Op::Mv; mv.dst = tmp[i]; mv.a = args[i];
-            bb.insts.push_back(std::move(mv));
-        }
-        // 2. Copy the temps back into the parameter vregs.
-        for (int i = 0; i < fn.numParams; i++) {
-            Inst mv; mv.op = Op::Mv; mv.dst = fn.paramRegs[i]; mv.a = Val::R(tmp[i]);
-            bb.insts.push_back(std::move(mv));
-        }
-        // 3. Jump back to the entry block instead of returning.
-        bb.term = Term::Jmp;
-        bb.succ0 = 0;
-        bb.succ1 = -1;
-        bb.retHasVal = false;
-        bb.retVal = Val::I(0);
-        any = true;
-    }
-    if (any) computeCFG(fn);
-}
-
 } // namespace
 
 void optimizeIR(IRModule& mod, bool opt) {
     if (opt) inlineFunctions(mod);
     for (auto& fn : mod.funcs) {
-        if (opt) tailCallElim(fn);
         // Phase 1: constant folding + algebraic simplification
         if (opt) constFold(fn);
         deadCodeElim(fn);
 
         if (opt) {
             // Phase 2: structural optimisations
-            globalConstProp(fn); // fold loads of constant globals to immediates
-            constFold(fn);       // fold the freshly materialised constants
             cse(fn);
             copyProp(fn);
             peephole(fn);
@@ -917,8 +600,6 @@ void optimizeIR(IRModule& mod, bool opt) {
             constFold(fn);       // fold again after jump threading
             copyProp(fn);        // propagate new Mvs
             peephole(fn);        // clean up
-            globalConstProp(fn); // re-run after CFG simplification exposed more
-            constFold(fn);
             deadCodeElim(fn);
 
             // Phase 3: loop optimisations
