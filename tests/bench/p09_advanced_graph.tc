@@ -1,6 +1,6 @@
 // p09_advanced_graph — 图算法风格：用全局数组模拟邻接（ToyC 无数组，用递归+全局变量模拟）。
 // 大量函数调用与分支，测试内联与寄存器分配。
-int acc;
+int acc = 0;
 
 int step(int node, int depth) {
     if (depth <= 0) return node % 7;
