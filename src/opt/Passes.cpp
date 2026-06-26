@@ -232,7 +232,7 @@ void hoistLoopConstants(IRFunc& fn) {
             for (int b = 0; b < n; b++) {
                 if (!inLoop[b]) continue;
                 for (auto& in : fn.blocks[b].insts)
-                    if (isCmp(in.op)) { tryHoist(in.a); tryHoist(in.b); }
+                    if (isBinary(in.op) || isCmp(in.op)) { tryHoist(in.a); tryHoist(in.b); }
             }
         }
     }
