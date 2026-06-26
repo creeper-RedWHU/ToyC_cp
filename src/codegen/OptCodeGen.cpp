@@ -41,6 +41,21 @@ void signedMagic(int32_t d, int32_t& M, int& s) {
     s = p - 32;
 }
 
+// Unsigned magic number for division by positive constant d (d >= 3, not pow2).
+// q = mulhu(n, M) >> s.  Finds smallest k so that M = ceil(2^(32+k)/d) < 2^32.
+void unsignedMagic(uint32_t d, uint32_t& M, int& s) {
+    for (int k = 0; k <= 32; k++) {
+        uint64_t two_pow = (1ULL << (32 + k));
+        uint64_t m = (two_pow + d - 1) / d;  // ceil
+        if (m < (1ULL << 32)) {
+            M = (uint32_t)m;
+            s = k;
+            return;
+        }
+    }
+    M = 0; s = 0;
+}
+
 Op invertCmp(Op op) {
     switch (op) {
         case Op::Lt: return Op::Ge; case Op::Ge: return Op::Lt;
@@ -72,6 +87,8 @@ private:
     int outArgArea_ = 0, spillBase_ = 0, calleeBase_ = 0, raOff_ = 0, frameSize_ = 0;
     std::vector<int> useCount_;
     int dstOverride_ = -1;   // force the next instruction's result into this reg
+    int curMagicVreg_ = -1; // pre-computed magic vreg for current Div/Mod by constant
+    bool curUnsigned_ = false; // use unsigned magic sequence for current Div/Mod
 
     int spillOff(int v) const { return spillBase_ + A_.spillSlot[v] * 4; }
 
@@ -138,6 +155,7 @@ private:
                     case Op::Call: for (auto& a : in.args) add(a); break;
                     default: add(in.a); add(in.b); break;
                 }
+                if (in.magicVreg >= 0) useCount_[in.magicVreg]++;
             }
             if (bb.term == Term::Br && bb.cond.isReg()) useCount_[bb.cond.reg]++;
             if (bb.term == Term::Ret && bb.retHasVal && bb.retVal.isReg()) useCount_[bb.retVal.reg]++;
@@ -358,12 +376,22 @@ private:
             emitMulConst(rd, ra, c); writeBack(dst, rd); return;
         }
         if (op == Op::Div && in.b.isImm() && opt_) {
+            curMagicVreg_ = in.magicVreg;
+            curUnsigned_ = in.unsignedDiv;
             int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
-            emitDivConst(rd, ra, in.b.imm); writeBack(dst, rd); return;
+            emitDivConst(rd, ra, in.b.imm); writeBack(dst, rd);
+            curMagicVreg_ = -1;
+            curUnsigned_ = false;
+            return;
         }
         if (op == Op::Mod && in.b.isImm() && opt_) {
+            curMagicVreg_ = in.magicVreg;
+            curUnsigned_ = in.unsignedDiv;
             int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
-            emitModConst(rd, ra, in.b.imm); writeBack(dst, rd); return;
+            emitModConst(rd, ra, in.b.imm); writeBack(dst, rd);
+            curMagicVreg_ = -1;
+            curUnsigned_ = false;
+            return;
         }
 
         int ra = toReg(in.a, SCRATCH0);
@@ -422,12 +450,40 @@ private:
     }
 
     // q = ra / c into register `qreg`, using the signed magic sequence.
-    // Uses t6 and a7 as scratch; ra is preserved.
+    // Uses t6 and a7 as scratch; ra is preserved.  If magicVreg_ is set, the
+    // magic number is already materialised in that vreg's register (hoisted
+    // out of the loop by hoistMagicDiv), so we skip the per-iteration li.
+    // When curUnsigned_ is true, uses the cheaper unsigned sequence (mulhu +
+    // srli, no sign fixup).
     void emitMagicQuotient(int qreg, int ra, int32_t c) {
-        int32_t M; int s; signedMagic(c, M, s);
         std::string Q = regName(qreg), R = regName(ra), T = regName(SCRATCH1), W = regName(X_A7);
-        out_ << "  li " << T << ", " << M << "\n";
-        out_ << "  mulh " << W << ", " << R << ", " << T << "\n";
+        std::string magicReg;
+
+        if (curUnsigned_) {
+            // Unsigned: q = mulhu(n, M) >> s
+            uint32_t M; int s;
+            unsignedMagic((uint32_t)c, M, s);
+            if (curMagicVreg_ >= 0) {
+                magicReg = regName(toReg(Val::R(curMagicVreg_), X_A7));
+            } else {
+                out_ << "  li " << T << ", " << (int32_t)M << "\n";
+                magicReg = T;
+            }
+            out_ << "  mulhu " << W << ", " << R << ", " << magicReg << "\n";
+            if (s > 0) out_ << "  srli " << Q << ", " << W << ", " << s << "\n";
+            else if (Q != W) out_ << "  mv " << Q << ", " << W << "\n";
+            return;
+        }
+
+        // Signed
+        int32_t M; int s; signedMagic(c, M, s);
+        if (curMagicVreg_ >= 0) {
+            magicReg = regName(toReg(Val::R(curMagicVreg_), X_A7));
+        } else {
+            out_ << "  li " << T << ", " << M << "\n";
+            magicReg = T;
+        }
+        out_ << "  mulh " << W << ", " << R << ", " << magicReg << "\n";
         if (c > 0 && M < 0) out_ << "  add " << W << ", " << W << ", " << R << "\n";
         else if (c < 0 && M > 0) out_ << "  sub " << W << ", " << W << ", " << R << "\n";
         if (s > 0) out_ << "  srai " << W << ", " << W << ", " << s << "\n";
@@ -466,6 +522,29 @@ private:
             return;
         }
         // |c| >= 3, not a power of two:  r = n - (n/c)*c  via magic division
+        if (curUnsigned_) {
+            // Unsigned: mulhu + optional srli, then q*c, then sub.
+            // When s=0, skip the mv by using mulhu output directly.
+            uint32_t M; int s;
+            unsignedMagic((uint32_t)c, M, s);
+            std::string magicReg;
+            if (curMagicVreg_ >= 0) {
+                magicReg = regName(toReg(Val::R(curMagicVreg_), X_A7));
+            } else {
+                out_ << "  li " << S << ", " << (int32_t)M << "\n";
+                magicReg = S;
+            }
+            out_ << "  mulhu " << regName(X_A7) << ", " << R << ", " << magicReg << "\n";
+            int qreg = X_A7;
+            if (s > 0) {
+                out_ << "  srli " << regName(X_A6) << ", " << regName(X_A7) << ", " << s << "\n";
+                qreg = X_A6;
+            }
+            emitMulConst(X_A7, qreg, c);   // a7 = q * c (strength-reduced)
+            out_ << "  sub " << D << ", " << R << ", " << regName(X_A7) << "\n";
+            return;
+        }
+        // Signed
         emitMagicQuotient(X_A6, ra, c);
         emitMulConst(X_A7, X_A6, c);   // a7 = q * c (strength-reduced)
         out_ << "  sub " << D << ", " << R << ", " << regName(X_A7) << "\n";
