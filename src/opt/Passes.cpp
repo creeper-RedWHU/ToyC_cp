@@ -231,6 +231,118 @@ void inlineFunctions(IRModule& mod) {
     }
 }
 
+// ---- global constant-store forwarding --------------------------------------
+// Intraprocedural, dominance-respecting forwarding of globals that currently
+// hold a known constant. The ToyC IR is NOT in SSA form and globals are mutable
+// shared state, so we run a forward dataflow analysis over a 3-valued lattice
+// per global:  Top (no info yet) > Const(c) > Bottom (varies / unknown).
+//
+//   StoreGlobal gid, imm  -> gid = Const(imm)
+//   StoreGlobal gid, reg  -> gid = Bottom
+//   Call                  -> ALL globals = Bottom (callee may write any)
+//   LoadGlobal gid -> dst -> if gid is Const(c), rewrite to `Mv dst, c`
+//
+// The meet over predecessors is the lattice meet (Const(c) survives only if
+// every predecessor agrees on the same c; disagreement -> Bottom). Crucially we
+// initialise every block's OUT to Top (optimistic) and the entry IN to Bottom
+// (a function may be entered with globals in any state -- always sound), then
+// iterate to a fixpoint. Optimistic Top init is what lets a constant store in
+// the loop preheader reach loads inside the loop body: a pessimistic empty init
+// would let the back-edge's empty state intersect the header down to nothing on
+// the first pass. The big win lands after inlining, when a callee's reads sit in
+// the same function as the constant stores (p11: `G = k` in main, hot loop reads
+// G via the inlined `compute`).
+enum class CState { Top, Const, Bottom };
+struct Cell {
+    CState s = CState::Top;
+    int32_t c = 0;
+    bool operator==(const Cell& o) const {
+        return s == o.s && (s != CState::Const || c == o.c);
+    }
+    bool operator!=(const Cell& o) const { return !(*this == o); }
+};
+using GMap = std::map<int, Cell>;   // absent key == Top
+
+static Cell meetCell(const Cell& a, const Cell& b) {
+    if (a.s == CState::Top) return b;
+    if (b.s == CState::Top) return a;
+    if (a.s == CState::Bottom || b.s == CState::Bottom) return {CState::Bottom, 0};
+    // both Const
+    if (a.c == b.c) return a;
+    return {CState::Bottom, 0};
+}
+
+// Meet of predecessors' OUT states. Absent in a map means Top, so a gid present
+// in any predecessor must be met against Top (identity) for the others.
+static GMap meetPreds(const std::vector<GMap>& out, const std::vector<int>& preds) {
+    GMap r;
+    for (int p : preds)
+        for (auto& [gid, cell] : out[p]) {
+            auto it = r.find(gid);
+            if (it == r.end()) r[gid] = cell;       // Top ∧ cell = cell
+            else it->second = meetCell(it->second, cell);
+        }
+    return r;
+}
+
+static void transferGlobals(const BasicBlock& bb, GMap& st) {
+    for (auto& in : bb.insts) {
+        if (in.op == Op::Call) {
+            for (auto& [gid, cell] : st) cell = {CState::Bottom, 0};
+        } else if (in.op == Op::StoreGlobal) {
+            if (in.a.isImm()) st[in.gid] = {CState::Const, in.a.imm};
+            else st[in.gid] = {CState::Bottom, 0};
+        }
+    }
+}
+
+bool globalConstProp(IRFunc& fn) {
+    computeCFG(fn);
+    int n = (int)fn.blocks.size();
+    if (n == 0) return false;
+
+    // Globals referenced anywhere in this function: at entry they are unknown.
+    GMap entryIn;
+    for (auto& bb : fn.blocks)
+        for (auto& in : bb.insts)
+            if (in.op == Op::LoadGlobal || in.op == Op::StoreGlobal)
+                entryIn[in.gid] = {CState::Bottom, 0};
+    if (entryIn.empty()) return false;
+
+    std::vector<GMap> in(n), out(n);   // OUT starts Top (empty map) = optimistic
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int b = 0; b < n; b++) {
+            GMap ni = (b == 0) ? entryIn : meetPreds(out, fn.blocks[b].preds);
+            in[b] = ni;
+            transferGlobals(fn.blocks[b], ni);
+            if (ni != out[b]) { out[b] = std::move(ni); changed = true; }
+        }
+    }
+
+    bool any = false;
+    for (int b = 0; b < n; b++) {
+        GMap st = in[b];
+        for (auto& inst : fn.blocks[b].insts) {
+            if (inst.op == Op::LoadGlobal) {
+                auto it = st.find(inst.gid);
+                if (it != st.end() && it->second.s == CState::Const) {
+                    inst.op = Op::Mv; inst.a = Val::I(it->second.c);
+                    inst.gid = -1;
+                    any = true;
+                }
+            } else if (inst.op == Op::Call) {
+                for (auto& [gid, cell] : st) cell = {CState::Bottom, 0};
+            } else if (inst.op == Op::StoreGlobal) {
+                if (inst.a.isImm()) st[inst.gid] = {CState::Const, inst.a.imm};
+                else st[inst.gid] = {CState::Bottom, 0};
+            }
+        }
+    }
+    return any;
+}
+
 // ---- dead code elimination -------------------------------------------------
 // Remove value-producing instructions whose result is never used. Calls and
 // global stores have side effects and are always kept.
@@ -746,6 +858,8 @@ void optimizeIR(IRModule& mod, bool opt) {
 
         if (opt) {
             // Phase 2: structural optimisations
+            globalConstProp(fn); // fold loads of constant globals to immediates
+            constFold(fn);       // fold the freshly materialised constants
             cse(fn);
             copyProp(fn);
             peephole(fn);
@@ -753,6 +867,8 @@ void optimizeIR(IRModule& mod, bool opt) {
             constFold(fn);       // fold again after jump threading
             copyProp(fn);        // propagate new Mvs
             peephole(fn);        // clean up
+            globalConstProp(fn); // re-run after CFG simplification exposed more
+            constFold(fn);
             deadCodeElim(fn);
 
             // Phase 3: loop optimisations
