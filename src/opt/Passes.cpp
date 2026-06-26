@@ -657,36 +657,6 @@ bool peephole(IRFunc& fn) {
     return any;
 }
 
-// ---- constant propagation (block-local, immediate Mv sources) --------------
-// Forward-substitute constants produced by `Mv dst, imm` into later operands
-// within the same block. This is complementary to copyProp (which only tracks
-// register-to-register copies) and is safe under non-SSA: every redefinition
-// of a vreg kills its known-constant entry unless the redefinition is itself a
-// new `Mv dst, imm`.
-bool constProp(IRFunc& fn) {
-    bool any = false;
-    for (auto& bb : fn.blocks) {
-        std::unordered_map<int, int32_t> cmap;   // vreg -> known constant
-        auto sub = [&](Val& v) {
-            if (v.isReg()) {
-                auto it = cmap.find(v.reg);
-                if (it != cmap.end()) { v = Val::I(it->second); any = true; }
-            }
-        };
-        for (auto& in : bb.insts) {
-            sub(in.a); sub(in.b);
-            for (auto& a : in.args) sub(a);
-            if (in.dst >= 0) {
-                if (in.op == Op::Mv && in.a.isImm()) cmap[in.dst] = in.a.imm;
-                else cmap.erase(in.dst);
-            }
-        }
-        if (bb.term == Term::Br) sub(bb.cond);
-        if (bb.term == Term::Ret && bb.retHasVal) sub(bb.retVal);
-    }
-    return any;
-}
-
 // ---- loop-invariant code motion (LICM) -------------------------------------
 // Hoist instructions whose operands are all defined outside the loop.
 void licm(IRFunc& fn) {
@@ -936,7 +906,6 @@ void optimizeIR(IRModule& mod, bool opt) {
         if (opt) constFold(fn);
         deadCodeElim(fn);
 
-        if (opt) {
         if (opt) {
             // Phase 1.5: mark unsigned division before copyProp eliminates
             // initial variable definitions (Mv x, 0) that prove non-negativity.
