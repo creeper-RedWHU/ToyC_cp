@@ -346,9 +346,25 @@ private:
             int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
             out_ << "  slti " << regName(rd) << ", " << regName(ra) << ", " << in.b.imm << "\n"; writeBack(dst, rd); return;
         }
+        // Le r, c  →  Lt r, c+1  →  slti rd, ra, c+1  (avoid slt + xori pair)
+        if (op == Op::Le && in.b.isImm()) {
+            long c1 = (long)in.b.imm + 1;
+            if (fits12(c1)) {
+                int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
+                out_ << "  slti " << regName(rd) << ", " << regName(ra) << ", " << (int)c1 << "\n";
+                writeBack(dst, rd); return;
+            }
+        }
         if ((op == Op::Eq || op == Op::Ne) && in.b.isImm() && in.b.imm == 0) {
             int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
             out_ << (op == Op::Eq ? "  seqz " : "  snez ") << regName(rd) << ", " << regName(ra) << "\n"; writeBack(dst, rd); return;
+        }
+        // Eq/Ne with a non-zero constant: addi + seqz/snez instead of li + sub + seqz
+        if ((op == Op::Eq || op == Op::Ne) && in.b.isImm() && fits12(-(long)in.b.imm)) {
+            int ra = toReg(in.a, SCRATCH0); int rd = dstReg(dst, SCRATCH0);
+            out_ << "  addi " << regName(SCRATCH1) << ", " << regName(ra) << ", " << (-in.b.imm) << "\n";
+            out_ << (op == Op::Eq ? "  seqz " : "  snez ") << regName(rd) << ", " << regName(SCRATCH1) << "\n";
+            writeBack(dst, rd); return;
         }
         // strength reduction by a constant
         if (op == Op::Mul && (in.a.isImm() || in.b.isImm())) {
