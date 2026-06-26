@@ -627,11 +627,59 @@ void licm(IRFunc& fn) {
     }
 }
 
+// ---- self tail-call elimination --------------------------------------------
+// Rewrite `return self(args);` into a jump back to the function entry, updating
+// the parameter vregs in place — turning self tail recursion into a loop and
+// dropping the per-call stack-frame setup/teardown. ToyC forbids mutual
+// recursion and forward calls, so only direct self-recursion can occur; we
+// match it by name (function names are unique). The entry block (index 0)
+// becomes the loop header: jumping to its label re-enters the body after the
+// prologue, re-reading the (updated) parameter vregs. Locals are recomputed
+// each iteration, which is exactly the call semantics. Because the entry block
+// has no predecessor outside the loop, LICM/const-hoist (which require a single
+// outside preheader) correctly skip this loop.
+void tailCallElim(IRFunc& fn) {
+    if (fn.blocks.empty()) return;
+    bool any = false;
+    for (auto& bb : fn.blocks) {
+        if (bb.term != Term::Ret || !bb.retHasVal || bb.insts.empty()) continue;
+        Inst& call = bb.insts.back();
+        if (call.op != Op::Call || !call.callee || call.callee->name != fn.name) continue;
+        if (call.dst < 0 || !bb.retVal.isReg() || bb.retVal.reg != call.dst) continue;
+        if ((int)call.args.size() != fn.numParams) continue;
+
+        // 1. Evaluate every argument into a fresh temp first, so swaps like
+        //    f(b, a) don't clobber a parameter before it has been read.
+        std::vector<Val> args = call.args;     // copy before we drop the Call
+        std::vector<int> tmp(fn.numParams);
+        bb.insts.pop_back();                   // remove the tail Call
+        for (int i = 0; i < fn.numParams; i++) {
+            tmp[i] = fn.numVregs++;
+            Inst mv; mv.op = Op::Mv; mv.dst = tmp[i]; mv.a = args[i];
+            bb.insts.push_back(std::move(mv));
+        }
+        // 2. Copy the temps back into the parameter vregs.
+        for (int i = 0; i < fn.numParams; i++) {
+            Inst mv; mv.op = Op::Mv; mv.dst = fn.paramRegs[i]; mv.a = Val::R(tmp[i]);
+            bb.insts.push_back(std::move(mv));
+        }
+        // 3. Jump back to the entry block instead of returning.
+        bb.term = Term::Jmp;
+        bb.succ0 = 0;
+        bb.succ1 = -1;
+        bb.retHasVal = false;
+        bb.retVal = Val::I(0);
+        any = true;
+    }
+    if (any) computeCFG(fn);
+}
+
 } // namespace
 
 void optimizeIR(IRModule& mod, bool opt) {
     if (opt) inlineFunctions(mod);
     for (auto& fn : mod.funcs) {
+        if (opt) tailCallElim(fn);
         // Phase 1: constant folding + algebraic simplification
         if (opt) constFold(fn);
         deadCodeElim(fn);
