@@ -238,10 +238,80 @@ void hoistLoopConstants(IRFunc& fn) {
     }
 }
 
+// ---- hoist Div/Mod constant operands out of loops --------------------------
+// For `Div x, k` / `Mod x, k` with a constant k inside a loop, hoist k into a
+// preheader vreg. This makes codegen emit a single `div`/`rem` with a register
+// operand per iteration (1 insn) instead of the magic-number sequence that
+// re-materialises `li M` every iteration (~8 insn). Purely additive: does not
+// touch licm or hoistLoopConstants.
+void hoistDivModConstants(IRFunc& fn) {
+    computeCFG(fn);
+    int n = (int)fn.blocks.size();
+    if (n == 0) return;
+    auto dom = computeDom(fn);
+
+    for (int u = 0; u < n; u++) {
+        int s[2], ns; succsOf(fn.blocks[u], s, ns);
+        for (int i = 0; i < ns; i++) {
+            int v = s[i];
+            if (v < 0 || !dom[u][v]) continue;
+
+            std::vector<char> inLoop(n, 0);
+            inLoop[v] = 1;
+            std::vector<int> wl;
+            if (u != v) { inLoop[u] = 1; wl.push_back(u); }
+            while (!wl.empty()) {
+                int x = wl.back(); wl.pop_back();
+                for (int p : fn.blocks[x].preds)
+                    if (!inLoop[p]) { inLoop[p] = 1; wl.push_back(p); }
+            }
+
+            int pre = -1; int outside = 0;
+            for (int p : fn.blocks[v].preds)
+                if (!inLoop[p]) { outside++; pre = p; }
+            if (outside != 1) continue;
+            if (fn.blocks[pre].term != Term::Jmp || fn.blocks[pre].succ0 != v) continue;
+
+            // Hoist distinct non-zero Div/Mod constant second-operands. Avoid
+            // constants that are powers of two (codegen already lowers those to
+            // shifts without any `li`, so hoisting would not help and could
+            // pessimize by forcing a register `div`/`rem`).
+            std::map<int32_t, int> hoisted;
+            auto isPow2 = [](int32_t x) -> bool {
+                return x > 0 && (x & (x - 1)) == 0;
+            };
+            auto tryHoist = [&](Val& operand) {
+                if (!operand.isImm() || operand.imm == 0) return;
+                if (operand.imm == 1 || operand.imm == -1) return;  // folded by constFold
+                if (isPow2(operand.imm)) return;                     // codegen uses shifts
+                auto it = hoisted.find(operand.imm);
+                int reg;
+                if (it == hoisted.end()) {
+                    reg = fn.numVregs++;
+                    hoisted[operand.imm] = reg;
+                    Inst mv; mv.op = Op::Mv; mv.dst = reg; mv.a = operand;
+                    fn.blocks[pre].insts.push_back(std::move(mv));
+                } else reg = it->second;
+                operand = Val::R(reg);
+            };
+            for (int b = 0; b < n; b++) {
+                if (!inLoop[b]) continue;
+                for (auto& in : fn.blocks[b].insts)
+                    if (in.op == Op::Div || in.op == Op::Mod) tryHoist(in.b);
+            }
+        }
+    }
+}
+
 // ---- constant folding & algebraic simplification ---------------------------
 // Fold constant operands and apply algebraic identities:
-//   x+0=x, 0+x=x, x-0=x, x*0=0, 0*x=0, x*1=x, 1*x=x, x/1=x, x%1=0, x-x=0
-// Also fold comparisons with known constants.
+//   x+0=x, 0+x=x, x-0=x, 0-x=Neg(x), x*0=0, 0*x=0, x*1=x, 1*x=x,
+//   x*-1=Neg(x), x/1=x, x/-1=Neg(x), x%1=0, x-x=0, x/x=1,
+//   Lt(x,x)=0, Gt(x,x)=0, Le(x,x)=1, Ge(x,x)=1, Eq(x,x)=1, Ne(x,x)=0.
+// Also fold comparisons and binary ops with two constant operands.
+static bool sameReg(const Val& a, const Val& b) {
+    return a.isReg() && b.isReg() && a.reg == b.reg;
+}
 bool constFold(IRFunc& fn) {
     bool any = false;
     for (auto& bb : fn.blocks) {
@@ -256,21 +326,22 @@ bool constFold(IRFunc& fn) {
                 if (in.a.isImm() && in.b.isImm()) {
                     int32_t av = in.a.imm, bv = in.b.imm;
                     int32_t res = 0;
+                    bool ok = true;
                     switch (in.op) {
                         case Op::Add: res = av + bv; break;
                         case Op::Sub: res = av - bv; break;
                         case Op::Mul: res = av * bv; break;
-                        case Op::Div: if (bv != 0) res = av / bv; else break;
-                        case Op::Mod: if (bv != 0) res = av % bv; else break;
+                        case Op::Div: if (bv == 0) ok = false; else res = av / bv; break;
+                        case Op::Mod: if (bv == 0) ok = false; else res = av % bv; break;
                         case Op::Lt:  res = av < bv; break;
                         case Op::Gt:  res = av > bv; break;
                         case Op::Le:  res = av <= bv; break;
                         case Op::Ge:  res = av >= bv; break;
                         case Op::Eq:  res = av == bv; break;
                         case Op::Ne:  res = av != bv; break;
-                        default: break;
+                        default: ok = false; break;
                     }
-                    if (in.op != Op::Div && in.op != Op::Mod || bv != 0) {
+                    if (ok) {
                         r.op = Op::Mv; r.a = Val::I(res); r.b = Val::I(0);
                         folded = true; any = true;
                     }
@@ -279,83 +350,53 @@ bool constFold(IRFunc& fn) {
                 if (!folded) {
                     bool aImm = in.a.isImm(), bImm = in.b.isImm();
                     int32_t av = in.a.imm, bv = in.b.imm;
+                    auto toMvA = [&]() { r = in; r.op = Op::Mv; r.a = in.a; r.b = Val::I(0); };
+                    auto toMvB = [&]() { r = in; r.op = Op::Mv; r.a = in.b; r.b = Val::I(0); };
+                    auto toMvI = [&](int32_t v) { r.op = Op::Mv; r.a = Val::I(v); r.b = Val::I(0); };
+                    auto toNeg = [&](Val v) { r.op = Op::Neg; r.a = v; r.b = Val::I(0); };
                     switch (in.op) {
                         case Op::Add:
-                            if (aImm && av == 0) { r = in; r.op = Op::Mv; r.a = in.b; folded = true; any = true; }
-                            else if (bImm && bv == 0) { r = in; r.op = Op::Mv; r.a = in.a; folded = true; any = true; }
+                            if (aImm && av == 0) { toMvB(); folded = true; any = true; }
+                            else if (bImm && bv == 0) { toMvA(); folded = true; any = true; }
                             break;
                         case Op::Sub:
-                            if (bImm && bv == 0) { r = in; r.op = Op::Mv; r.a = in.a; folded = true; any = true; }
-                            if (!aImm && !bImm && in.a.tag == in.b.tag && in.a.reg == in.b.reg) {
-                                r.op = Op::Mv; r.a = Val::I(0); folded = true; any = true;
-                            }
+                            if (bImm && bv == 0) { toMvA(); folded = true; any = true; }
+                            else if (aImm && av == 0) { toNeg(in.b); folded = true; any = true; }
+                            else if (sameReg(in.a, in.b)) { toMvI(0); folded = true; any = true; }
                             break;
                         case Op::Mul:
-                            if ((aImm && av == 0) || (bImm && bv == 0)) { r.op = Op::Mv; r.a = Val::I(0); folded = true; any = true; }
-                            else if (aImm && av == 1) { r.op = Op::Mv; r.a = in.b; folded = true; any = true; }
-                            else if (bImm && bv == 1) { r.op = Op::Mv; r.a = in.a; folded = true; any = true; }
+                            if ((aImm && av == 0) || (bImm && bv == 0)) { toMvI(0); folded = true; any = true; }
+                            else if (aImm && av == 1) { toMvB(); folded = true; any = true; }
+                            else if (bImm && bv == 1) { toMvA(); folded = true; any = true; }
+                            else if (aImm && av == -1) { toNeg(in.b); folded = true; any = true; }
+                            else if (bImm && bv == -1) { toNeg(in.a); folded = true; any = true; }
                             break;
                         case Op::Div:
-                            if (bImm && bv == 1) { r.op = Op::Mv; r.a = in.a; folded = true; any = true; }
+                            if (bImm && bv == 1) { toMvA(); folded = true; any = true; }
+                            else if (bImm && bv == -1) { toNeg(in.a); folded = true; any = true; }
+                            else if (sameReg(in.a, in.b)) { toMvI(1); folded = true; any = true; }
                             break;
                         case Op::Mod:
-                            if (bImm && bv == 1) { r.op = Op::Mv; r.a = Val::I(0); folded = true; any = true; }
+                            if (bImm && (bv == 1 || bv == -1)) { toMvI(0); folded = true; any = true; }
+                            else if (sameReg(in.a, in.b)) { toMvI(0); folded = true; any = true; }
                             break;
-                        case Op::Eq:
-                            if (!aImm && !bImm && in.a.tag == in.b.tag && in.a.reg == in.b.reg) {
-                                r.op = Op::Mv; r.a = Val::I(1); folded = true; any = true;
-                            }
-                            break;
-                        case Op::Ne:
-                            if (!aImm && !bImm && in.a.tag == in.b.tag && in.a.reg == in.b.reg) {
-                                r.op = Op::Mv; r.a = Val::I(0); folded = true; any = true;
-                            }
-                            break;
+                        case Op::Lt: if (sameReg(in.a, in.b)) { toMvI(0); folded = true; any = true; } break;
+                        case Op::Gt: if (sameReg(in.a, in.b)) { toMvI(0); folded = true; any = true; } break;
+                        case Op::Le: if (sameReg(in.a, in.b)) { toMvI(1); folded = true; any = true; } break;
+                        case Op::Ge: if (sameReg(in.a, in.b)) { toMvI(1); folded = true; any = true; } break;
+                        case Op::Eq: if (sameReg(in.a, in.b)) { toMvI(1); folded = true; any = true; } break;
+                        case Op::Ne: if (sameReg(in.a, in.b)) { toMvI(0); folded = true; any = true; } break;
                         default: break;
                     }
                 }
             }
             // Neg(0) → 0, Not(0) → 1, Not(1) → 0
             if (!folded && in.a.isImm()) {
-                if (in.op == Op::Neg) { r.op = Op::Mv; r.a = Val::I(-in.a.imm); folded = true; any = true; }
-                if (in.op == Op::Not) { r.op = Op::Mv; r.a = Val::I(in.a.imm == 0 ? 1 : 0); folded = true; any = true; }
+                if (in.op == Op::Neg) { r.op = Op::Mv; r.a = Val::I(-in.a.imm); r.b = Val::I(0); folded = true; any = true; }
+                if (in.op == Op::Not) { r.op = Op::Mv; r.a = Val::I(in.a.imm == 0 ? 1 : 0); r.b = Val::I(0); folded = true; any = true; }
             }
             if (folded) out.push_back(r);
             else out.push_back(in);
-        }
-        bb.insts = std::move(out);
-    }
-    return any;
-}
-
-// ---- strength reduction ----------------------------------------------------
-// Replace expensive operations with cheaper equivalents:
-//   x*2^k → x<<k, x/2^k → x>>k, x%2^k → x & (2^k-1)
-//   x*3 → (x<<1)+x, etc.
-bool strengthReduction(IRFunc& fn) {
-    bool any = false;
-    auto isPow2 = [](int32_t v) -> int {
-        if (v <= 0) return -1;
-        if ((v & (v - 1)) == 0) { int k = 0; while (v > 1) { v >>= 1; k++; } return k; }
-        return -1;
-    };
-    for (auto& bb : fn.blocks) {
-        std::vector<Inst> out;
-        out.reserve(bb.insts.size());
-        for (auto& in : bb.insts) {
-            if (in.op == Op::Mul && in.b.isImm()) {
-                int k = isPow2(in.b.imm);
-                if (k >= 1) {
-                    // x * 2^k → x << k  (use add-based shift since ToyC IR has no shift)
-                    // We'll emit it as repeated adds via the codegen strength reduction
-                    // For IR level, keep as Mul but mark for codegen
-                    out.push_back(in);
-                } else {
-                    out.push_back(in);
-                }
-            } else {
-                out.push_back(in);
-            }
         }
         bb.insts = std::move(out);
     }
@@ -441,25 +482,86 @@ bool copyProp(IRFunc& fn) {
 }
 
 // ---- common subexpression elimination (CSE) --------------------------------
-// Within each basic block, detect identical binary expressions and replace
-// later occurrences with the earlier result.
+// Within each basic block, detect identical expressions and replace later
+// occurrences with the earlier result. Handles binary ops (including those
+// with an immediate operand), unary ops (Neg/Not), and redundant LoadGlobal.
 bool cseBlock(BasicBlock& bb) {
     bool any = false;
     std::unordered_map<BinKey, int, BinKeyHash> avail;
+    std::unordered_map<int64_t, int> availUnary;   // key: op<<32 | reg
+    std::unordered_map<int, int> availLoad;        // gid -> dst
     std::vector<Inst> out;
     out.reserve(bb.insts.size());
 
     auto killDef = [&](int d) {
         std::vector<BinKey> toRemove;
-        for (auto& [key, reg] : avail) {
+        for (auto& [key, reg] : avail)
             if ((key.aTag == 1 && key.aReg == d) || (key.bTag == 1 && key.bReg == d))
                 toRemove.push_back(key);
-        }
         for (auto& k : toRemove) avail.erase(k);
+        std::vector<int64_t> ur;
+        for (auto& [k, reg] : availUnary)
+            if ((int)(k & 0x7fffffff) == d) ur.push_back(k);
+        for (auto& k : ur) availUnary.erase(k);
+        std::vector<int> gr;
+        for (auto& [g, reg] : availLoad)
+            if (reg == d) gr.push_back(g);
+        for (auto& g : gr) availLoad.erase(g);
+    };
+
+    auto unaryKey = [](Op op, int reg) -> int64_t {
+        return ((int64_t)op << 32) | (uint32_t)reg;
     };
 
     for (auto& in : bb.insts) {
-        if (isBinary(in.op) && in.a.isReg() && in.b.isReg()) {
+        // LoadGlobal CSE: reuse prior load of the same global if no store clobbered it.
+        if (in.op == Op::LoadGlobal) {
+            auto it = availLoad.find(in.gid);
+            if (it != availLoad.end()) {
+                Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = Val::R(it->second);
+                out.push_back(std::move(mv));
+                killDef(in.dst);
+                any = true;
+                continue;
+            }
+            if (in.dst >= 0) killDef(in.dst);
+            availLoad[in.gid] = in.dst;
+            out.push_back(in);
+            continue;
+        }
+        // StoreGlobal clobbers the loaded value of that global.
+        if (in.op == Op::StoreGlobal) {
+            availLoad.erase(in.gid);
+            if (in.a.isReg()) killDef(in.a.reg);
+            out.push_back(in);
+            continue;
+        }
+        // Calls may modify any global → drop all LoadGlobal availabilities.
+        if (in.op == Op::Call) {
+            availLoad.clear();
+            for (auto& a : in.args) if (a.isReg()) killDef(a.reg);
+            if (in.dst >= 0) killDef(in.dst);
+            out.push_back(in);
+            continue;
+        }
+        // Unary CSE: Neg(x) / Not(x) computed earlier in the block.
+        if ((in.op == Op::Neg || in.op == Op::Not) && in.a.isReg()) {
+            int64_t k = unaryKey(in.op, in.a.reg);
+            auto it = availUnary.find(k);
+            if (it != availUnary.end()) {
+                Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = Val::R(it->second);
+                out.push_back(std::move(mv));
+                killDef(in.dst);
+                any = true;
+                continue;
+            }
+            if (in.dst >= 0) killDef(in.dst);
+            availUnary[k] = in.dst;
+            out.push_back(in);
+            continue;
+        }
+        // Binary CSE: at least one register operand; immediates are part of the key.
+        if (isBinary(in.op) && (in.a.isReg() || in.b.isReg())) {
             BinKey key = makeKey(in);
             auto it = avail.find(key);
             if (it != avail.end()) {
@@ -469,18 +571,22 @@ bool cseBlock(BasicBlock& bb) {
                 any = true;
                 continue;
             }
+            if (in.dst >= 0) killDef(in.dst);
+            avail[makeKey(in)] = in.dst;
+            out.push_back(in);
+            continue;
         }
         if (in.dst >= 0) killDef(in.dst);
-        if (isBinary(in.op) && in.a.isReg() && in.b.isReg())
-            avail[makeKey(in)] = in.dst;
         out.push_back(in);
     }
     bb.insts = std::move(out);
     return any;
 }
 
-void cse(IRFunc& fn) {
-    for (auto& bb : fn.blocks) cseBlock(bb);
+bool cse(IRFunc& fn) {
+    bool any = false;
+    for (auto& bb : fn.blocks) any |= cseBlock(bb);
+    return any;
 }
 
 // ---- peephole optimization -------------------------------------------------
@@ -500,19 +606,49 @@ bool peephole(IRFunc& fn) {
                     if (out[i].dst == in.a.reg) {
                         if (out[i].op == in.op && out[i].a.isReg()) {
                             Inst mv; mv.op = Op::Mv; mv.dst = in.dst; mv.a = out[i].a;
+                            mv.b = Val::I(0);
                             out.push_back(std::move(mv));
                             any = true;
                             folded = true;
                         }
                         break;
                     }
-                    if (out[i].dst == in.a.reg) break;
                 }
                 if (folded) continue;
             }
             out.push_back(in);
         }
         bb.insts = std::move(out);
+    }
+    return any;
+}
+
+// ---- constant propagation (block-local, immediate Mv sources) --------------
+// Forward-substitute constants produced by `Mv dst, imm` into later operands
+// within the same block. This is complementary to copyProp (which only tracks
+// register-to-register copies) and is safe under non-SSA: every redefinition
+// of a vreg kills its known-constant entry unless the redefinition is itself a
+// new `Mv dst, imm`.
+bool constProp(IRFunc& fn) {
+    bool any = false;
+    for (auto& bb : fn.blocks) {
+        std::unordered_map<int, int32_t> cmap;   // vreg -> known constant
+        auto sub = [&](Val& v) {
+            if (v.isReg()) {
+                auto it = cmap.find(v.reg);
+                if (it != cmap.end()) { v = Val::I(it->second); any = true; }
+            }
+        };
+        for (auto& in : bb.insts) {
+            sub(in.a); sub(in.b);
+            for (auto& a : in.args) sub(a);
+            if (in.dst >= 0) {
+                if (in.op == Op::Mv && in.a.isImm()) cmap[in.dst] = in.a.imm;
+                else cmap.erase(in.dst);
+            }
+        }
+        if (bb.term == Term::Br) sub(bb.cond);
+        if (bb.term == Term::Ret && bb.retHasVal) sub(bb.retVal);
     }
     return any;
 }
@@ -592,19 +728,39 @@ void optimizeIR(IRModule& mod, bool opt) {
         deadCodeElim(fn);
 
         if (opt) {
-            // Phase 2: structural optimisations
-            cse(fn);
-            copyProp(fn);
-            peephole(fn);
-            jumpThreading(fn);
-            constFold(fn);       // fold again after jump threading
-            copyProp(fn);        // propagate new Mvs
-            peephole(fn);        // clean up
+            // Phase 2: structural optimisations iterated to a fixed point.
+            // Each pass is unchanged; we only drive them until they stop
+            // making progress so that constProp-then-constFold chains (e.g.
+            // p12's constant expression chain) fully collapse.
+            for (int iter = 0; iter < 12; iter++) {
+                bool changed = false;
+                changed |= constFold(fn);
+                changed |= cse(fn);
+                changed |= copyProp(fn);
+                changed |= constProp(fn);
+                changed |= peephole(fn);
+                changed |= jumpThreading(fn);
+                if (!changed) break;
+            }
             deadCodeElim(fn);
 
-            // Phase 3: loop optimisations
+            // Phase 3: loop optimisations (existing passes untouched) + new
+            // Div/Mod constant-operand hoisting.
             licm(fn);
             hoistLoopConstants(fn);
+            hoistDivModConstants(fn);
+            deadCodeElim(fn);
+
+            // Phase 4: a final cleanup sweep — hoisting may expose new
+            // constant/copy opportunities.
+            for (int iter = 0; iter < 4; iter++) {
+                bool changed = false;
+                changed |= constFold(fn);
+                changed |= constProp(fn);
+                changed |= copyProp(fn);
+                changed |= peephole(fn);
+                if (!changed) break;
+            }
             deadCodeElim(fn);
 
             unreachableElim(fn);
