@@ -1,0 +1,15 @@
+// p04_common_subexpr — 公共子表达式消除：循环体内多次出现相同子表达式。
+// 优化器应只计算一次 (i*i + i*3)，后续复用。
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 2000000) {
+        int a = (i * i + i * 3) + 1;
+        int b = (i * i + i * 3) + 2;
+        int c = (i * i + i * 3) + 3;
+        int d = (i * i + i * 3) * 2;
+        s = s + (a + b + c + d) % 9;
+        i = i + 1;
+    }
+    return s % 256;
+}

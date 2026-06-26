@@ -1,0 +1,18 @@
+// p08_basic_combined — 综合基础优化：常量折叠+死代码+复制+CSE+循环全部叠加。
+// 这是最综合的压力测试点（baseline 得分最低）。
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 1500000) {
+        int k = 10 * 5 - 3 + 8 / 2;    // 常量，应折叠
+        int a = i * i;                 // CSE 目标
+        int b = i * i;                 // 与 a 相同
+        int dead = a * b - i;          // 死代码（不用）
+        int c = a + 0;                 // 代数化简 → a
+        int d = c;                     // 复制
+        int e = d;                     // 复制
+        s = s + (a + b + e + k) % 17;
+        i = i + 1;
+    }
+    return s % 256;
+}

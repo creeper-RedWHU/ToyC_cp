@@ -1,0 +1,18 @@
+// p03_copy — 复制传播：大量 a=b 形式的拷贝链，优化器应折叠掉冗余 mv。
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 2000000) {
+        int a = i;
+        int b = a;
+        int c = b;
+        int d = c;
+        int e = d;
+        int f = e;
+        int g = f;
+        // a..g 全是同一个值的拷贝链，应传播为直接用 i
+        s = s + g % 7;
+        i = i + 1;
+    }
+    return s % 256;
+}

@@ -1,0 +1,23 @@
+// p11_global_const_prop — 全局常量传播：全局变量初始化为常量后只读。
+// 优化器若能识别全局常量并传播，可省去反复 load。
+int G1;
+int G2;
+int G3;
+
+int compute(int x) {
+    // G1/G2/G3 在 main 设定后不再改变，理想可常量传播
+    return (x * G1 + G2) % G3;
+}
+
+int main() {
+    G1 = 7;
+    G2 = 13;
+    G3 = 101;
+    int s = 0;
+    int i = 0;
+    while (i < 3000000) {
+        s = s + compute(i % 1000);
+        i = i + 1;
+    }
+    return s % 256;
+}

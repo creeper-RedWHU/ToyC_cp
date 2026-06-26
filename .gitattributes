@@ -1,0 +1,12 @@
+# 统一文本行尾，避免跨 Windows/WSL/Linux 协作时的 CRLF 污染。
+* text=auto eol=lf
+
+# Shell 脚本必须 LF（WSL/Linux 执行）
+*.sh text eol=lf
+# ToyC 测试用例、源码、文档
+*.tc text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.ld text eol=lf
+*.S text eol=lf

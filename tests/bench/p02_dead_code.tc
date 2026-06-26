@@ -1,0 +1,17 @@
+// p02_dead_code — 死代码消除：循环体内计算大量从不被使用的中间值。
+// 优化器应删除所有 dead 计算，只保留真正影响返回值的链路。
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 2000000) {
+        int dead1 = i * 7 + 13;
+        int dead2 = dead1 * 3 - i;
+        int dead3 = dead2 % 11 + dead1;
+        int dead4 = dead3 * dead2 - dead1 * i;
+        int dead5 = dead4 + dead3 - dead2 + dead1;
+        // 上面 5 个变量都不影响 s，应被全部删除
+        s = s + i % 5;
+        i = i + 1;
+    }
+    return s % 256;
+}

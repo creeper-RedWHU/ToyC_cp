@@ -1,0 +1,17 @@
+// p07_loop — 循环优化：嵌套循环，含循环不变量与归纳变量。
+// 内层不变计算应外提（LICM），归纳变量强度削减。
+int main() {
+    int s = 0;
+    int n = 2000;
+    int i = 0;
+    while (i < n) {
+        int base = i * 17 + 5;       // 内层循环不变
+        int j = 0;
+        while (j < n) {
+            s = s + (base + j) % 13;  // base 不随 j 变化
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s % 256;
+}

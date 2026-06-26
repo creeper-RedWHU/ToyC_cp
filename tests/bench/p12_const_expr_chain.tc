@@ -1,0 +1,18 @@
+// p12_const_expr_chain — 常量表达式链：长串相互依赖的常量定义。
+// 全部可在编译期折叠为单一常量；运行期循环只是放大计时。
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 3000000) {
+        int a = 3;
+        int b = a * 5 + 2;        // 17
+        int c = b * 2 - a;        // 31
+        int d = c + b * 3;        // 82
+        int e = d * 2 - c;        // 133
+        int f = e + d - c;        // 184
+        int g = f * 2 - e + a;    // 238
+        s = s + (g + i) % 19;
+        i = i + 1;
+    }
+    return s % 256;
+}

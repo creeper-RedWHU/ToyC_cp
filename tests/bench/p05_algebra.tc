@@ -1,0 +1,17 @@
+// p05_algebra — 代数化简：循环体内含可被恒等式消去的运算。
+// x+0, x*1, x-x, x*0, x/1 等应被化简。
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 2000000) {
+        int a = i + 0;          // = i
+        int b = a * 1;          // = a
+        int c = b - 0;          // = b
+        int d = (i - i) + c;    // i-i = 0 → = c
+        int e = d * 1 + i * 0;  // = d
+        int f = e / 1;          // = e
+        s = s + f % 7;
+        i = i + 1;
+    }
+    return s % 256;
+}

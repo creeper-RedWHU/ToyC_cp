@@ -1,0 +1,15 @@
+// p06_tail_recursion — 尾递归：累加器风格的尾递归，理想情况应转为循环。
+int sum_to(int n, int acc) {
+    if (n <= 0) return acc;
+    return sum_to(n - 1, acc + n % 100);
+}
+
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 8000) {
+        s = s + sum_to(500, 0);
+        i = i + 1;
+    }
+    return s % 256;
+}

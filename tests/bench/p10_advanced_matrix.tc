@@ -1,0 +1,26 @@
+// p10_advanced_matrix — 矩阵风格：三层嵌套循环模拟 N×N 矩阵乘累加。
+// ToyC 无数组，用算术函数模拟元素值。测试 LICM + 强度削减 + 寄存器分配。
+int elem(int r, int c) {
+    return (r * 31 + c * 17 + 7) % 97;
+}
+
+int main() {
+    int s = 0;
+    int N = 60;
+    int i = 0;
+    while (i < N) {
+        int j = 0;
+        while (j < N) {
+            int k = 0;
+            int sum = 0;
+            while (k < N) {
+                sum = sum + elem(i, k) * elem(k, j);
+                k = k + 1;
+            }
+            s = s + sum % 13;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s % 256;
+}
